@@ -1,0 +1,1557 @@
+From da7e6368dd577dead868be456ecfbfdaa7f3299f Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Thu, 15 Oct 2026 17:00:56 +0500
+Subject: [PATCH] ntdll/server: Implement ALPC Section Views and VIEW attribute
+ propagation
+
+---
+ dlls/kernelbase/debug.c        |   8 +
+ dlls/ntdll/ntdll.spec          |   8 +
+ dlls/ntdll/ntsyscalls.h        | 644 +++++++++++++++++----------------
+ dlls/ntdll/signal_arm64ec.c    |   4 +
+ dlls/ntdll/tests/alpc.c        | 195 ++++++++++
+ dlls/ntdll/unix/alpc.c         | 252 +++++++++++--
+ dlls/wow64/struct32.h          |   1 +
+ dlls/wow64/syscall.c           |  78 ++++
+ include/wine/server_protocol.h |  13 +-
+ include/winternl.h             |  10 +-
+ server/alpc.c                  |  45 ++-
+ server/protocol.def            |  11 +
+ 12 files changed, 911 insertions(+), 358 deletions(-)
+
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index 8656859..ab85cc3 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -545,6 +545,14 @@ static BOOL start_debugger( EXCEPTION_POINTERS *epointers, HANDLE event )
+ 
+     format_exception_msg( epointers, buffer, sizeof(buffer) );
+     MESSAGE( "wine: %s (thread %04lx), starting debugger...\n", buffer, GetCurrentThreadId() );
++    if (epointers && epointers->ContextRecord)
++    {
++        ULONG_PTR *sp = (ULONG_PTR *)epointers->ContextRecord->Rsp;
++        int i;
++        MESSAGE( "RIP=%p RSP=%p\n", (void *)epointers->ContextRecord->Rip, (void *)sp );
++        for (i = 0; i < 110; i++)
++            MESSAGE( "  stack[%02d] (%p) = %016Ix\n", i, &sp[i], sp[i] );
++    }
+ 
+     InitializeObjectAttributes( &attr, &nameW, 0, 0, NULL );
+     if (!NtOpenKey( &dbg_key, KEY_READ, &attr ))
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 8c10c6b..063e3a2 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -158,6 +158,10 @@
+ @ stdcall -syscall NtAlpcAcceptConnectPort(ptr ptr long ptr ptr ptr ptr ptr long)
+ @ stdcall -syscall NtAlpcConnectPort(ptr ptr ptr ptr long ptr ptr ptr ptr ptr ptr)
+ @ stdcall -syscall NtAlpcCreatePort(ptr ptr ptr)
++@ stdcall -syscall NtAlpcCreatePortSection(ptr long ptr long ptr ptr)
++@ stdcall -syscall NtAlpcCreateSectionView(ptr long ptr)
++@ stdcall -syscall NtAlpcDeletePortSection(ptr long ptr)
++@ stdcall -syscall NtAlpcDeleteSectionView(ptr long ptr)
+ @ stdcall -syscall NtAlpcDisconnectPort(ptr long)
+ @ stdcall -syscall NtAlpcImpersonateClientOfPort(ptr ptr ptr)
+ @ stdcall -syscall NtAlpcQueryInformation(ptr long ptr long ptr)
+@@ -1242,6 +1246,10 @@
+ @ stdcall -private ZwAlpcAcceptConnectPort(ptr ptr long ptr ptr ptr ptr ptr long) NtAlpcAcceptConnectPort
+ @ stdcall -private ZwAlpcConnectPort(ptr ptr ptr ptr long ptr ptr ptr ptr ptr ptr) NtAlpcConnectPort
+ @ stdcall -private ZwAlpcCreatePort(ptr ptr ptr) NtAlpcCreatePort
++@ stdcall -private ZwAlpcCreatePortSection(ptr long ptr long ptr ptr) NtAlpcCreatePortSection
++@ stdcall -private ZwAlpcCreateSectionView(ptr long ptr) NtAlpcCreateSectionView
++@ stdcall -private ZwAlpcDeletePortSection(ptr long ptr) NtAlpcDeletePortSection
++@ stdcall -private ZwAlpcDeleteSectionView(ptr long ptr) NtAlpcDeleteSectionView
+ @ stdcall -private ZwAlpcDisconnectPort(ptr long) NtAlpcDisconnectPort
+ @ stdcall -private ZwAlpcImpersonateClientOfPort(ptr ptr ptr) NtAlpcImpersonateClientOfPort
+ @ stdcall -private ZwAlpcQueryInformation(ptr long ptr long ptr) NtAlpcQueryInformation
+diff --git a/dlls/ntdll/ntsyscalls.h b/dlls/ntdll/ntsyscalls.h
+index d32c4dd..05e09ac 100644
+--- a/dlls/ntdll/ntsyscalls.h
++++ b/dlls/ntdll/ntsyscalls.h
+@@ -112,169 +112,173 @@
+     SYSCALL_ENTRY( 0x006c, NtAlpcAcceptConnectPort, 36 ) \
+     SYSCALL_ENTRY( 0x006d, NtAlpcConnectPort, 44 ) \
+     SYSCALL_ENTRY( 0x006e, NtAlpcCreatePort, 12 ) \
+-    SYSCALL_ENTRY( 0x006f, NtAlpcDisconnectPort, 8 ) \
+-    SYSCALL_ENTRY( 0x0070, NtAlpcImpersonateClientOfPort, 12 ) \
+-    SYSCALL_ENTRY( 0x0071, NtAlpcQueryInformation, 20 ) \
+-    SYSCALL_ENTRY( 0x0072, NtAlpcSendWaitReceivePort, 32 ) \
+-    SYSCALL_ENTRY( 0x0073, NtAreMappedFilesTheSame, 8 ) \
+-    SYSCALL_ENTRY( 0x0074, NtAssignProcessToJobObject, 8 ) \
+-    SYSCALL_ENTRY( 0x0075, NtAssociateWaitCompletionPacket, 32 ) \
+-    SYSCALL_ENTRY( 0x0076, NtCancelIoFileEx, 12 ) \
+-    SYSCALL_ENTRY( 0x0077, NtCancelSynchronousIoFile, 12 ) \
+-    SYSCALL_ENTRY( 0x0078, NtCancelWaitCompletionPacket, 8 ) \
+-    SYSCALL_ENTRY( 0x0079, NtCommitTransaction, 8 ) \
+-    SYSCALL_ENTRY( 0x007a, NtCompareObjects, 8 ) \
+-    SYSCALL_ENTRY( 0x007b, NtCompareTokens, 12 ) \
+-    SYSCALL_ENTRY( 0x007c, NtCompleteConnectPort, 4 ) \
+-    SYSCALL_ENTRY( 0x007d, NtConnectPort, 32 ) \
+-    SYSCALL_ENTRY( 0x007e, NtContinueEx, 8 ) \
+-    SYSCALL_ENTRY( 0x007f, NtConvertBetweenAuxiliaryCounterAndPerformanceCounter, 16 ) \
+-    SYSCALL_ENTRY( 0x0080, NtCreateDirectoryObject, 12 ) \
+-    SYSCALL_ENTRY( 0x0081, NtCreateIoCompletion, 16 ) \
+-    SYSCALL_ENTRY( 0x0082, NtCreateJobObject, 12 ) \
+-    SYSCALL_ENTRY( 0x0083, NtCreateKeyTransacted, 32 ) \
+-    SYSCALL_ENTRY( 0x0084, NtCreateKeyedEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x0085, NtCreateLowBoxToken, 36 ) \
+-    SYSCALL_ENTRY( 0x0086, NtCreateMailslotFile, 32 ) \
+-    SYSCALL_ENTRY( 0x0087, NtCreateMutant, 16 ) \
+-    SYSCALL_ENTRY( 0x0088, NtCreateNamedPipeFile, 56 ) \
+-    SYSCALL_ENTRY( 0x0089, NtCreatePagingFile, 16 ) \
+-    SYSCALL_ENTRY( 0x008a, NtCreatePort, 20 ) \
+-    SYSCALL_ENTRY( 0x008b, NtCreateSectionEx, 36 ) \
+-    SYSCALL_ENTRY( 0x008c, NtCreateSemaphore, 20 ) \
+-    SYSCALL_ENTRY( 0x008d, NtCreateSymbolicLinkObject, 16 ) \
+-    SYSCALL_ENTRY( 0x008e, NtCreateThreadEx, 44 ) \
+-    SYSCALL_ENTRY( 0x008f, NtCreateTimer, 16 ) \
+-    SYSCALL_ENTRY( 0x0090, NtCreateToken, 52 ) \
+-    SYSCALL_ENTRY( 0x0091, NtCreateTransaction, 40 ) \
+-    SYSCALL_ENTRY( 0x0092, NtCreateUserProcess, 44 ) \
+-    SYSCALL_ENTRY( 0x0093, NtCreateWaitCompletionPacket, 12 ) \
+-    SYSCALL_ENTRY( 0x0094, NtDebugActiveProcess, 8 ) \
+-    SYSCALL_ENTRY( 0x0095, NtDebugContinue, 12 ) \
+-    SYSCALL_ENTRY( 0x0096, NtDeleteAtom, 4 ) \
+-    SYSCALL_ENTRY( 0x0097, NtDeleteFile, 4 ) \
+-    SYSCALL_ENTRY( 0x0098, NtDeleteKey, 4 ) \
+-    SYSCALL_ENTRY( 0x0099, NtDeleteValueKey, 8 ) \
+-    SYSCALL_ENTRY( 0x009a, NtDisplayString, 4 ) \
+-    SYSCALL_ENTRY( 0x009b, NtFilterToken, 24 ) \
+-    SYSCALL_ENTRY( 0x009c, NtFlushBuffersFileEx, 20 ) \
+-    SYSCALL_ENTRY( 0x009d, NtFlushInstructionCache, 12 ) \
+-    SYSCALL_ENTRY( 0x009e, NtFlushKey, 4 ) \
+-    SYSCALL_ENTRY( 0x009f, NtFlushProcessWriteBuffers, 0 ) \
+-    SYSCALL_ENTRY( 0x00a0, NtFlushVirtualMemory, 16 ) \
+-    SYSCALL_ENTRY( 0x00a1, NtGetContextThread, 8 ) \
+-    SYSCALL_ENTRY( 0x00a2, NtGetCurrentProcessorNumber, 0 ) \
+-    SYSCALL_ENTRY( 0x00a3, NtGetNextProcess, 20 ) \
+-    SYSCALL_ENTRY( 0x00a4, NtGetNextThread, 24 ) \
+-    SYSCALL_ENTRY( 0x00a5, NtGetNlsSectionPtr, 20 ) \
++    SYSCALL_ENTRY( 0x006f, NtAlpcCreatePortSection, 24 ) \
++    SYSCALL_ENTRY( 0x0070, NtAlpcCreateSectionView, 12 ) \
++    SYSCALL_ENTRY( 0x0071, NtAlpcDeletePortSection, 12 ) \
++    SYSCALL_ENTRY( 0x0072, NtAlpcDeleteSectionView, 12 ) \
++    SYSCALL_ENTRY( 0x0073, NtAlpcDisconnectPort, 8 ) \
++    SYSCALL_ENTRY( 0x0074, NtAlpcImpersonateClientOfPort, 12 ) \
++    SYSCALL_ENTRY( 0x0075, NtAlpcQueryInformation, 20 ) \
++    SYSCALL_ENTRY( 0x0076, NtAlpcSendWaitReceivePort, 32 ) \
++    SYSCALL_ENTRY( 0x0077, NtAreMappedFilesTheSame, 8 ) \
++    SYSCALL_ENTRY( 0x0078, NtAssignProcessToJobObject, 8 ) \
++    SYSCALL_ENTRY( 0x0079, NtAssociateWaitCompletionPacket, 32 ) \
++    SYSCALL_ENTRY( 0x007a, NtCancelIoFileEx, 12 ) \
++    SYSCALL_ENTRY( 0x007b, NtCancelSynchronousIoFile, 12 ) \
++    SYSCALL_ENTRY( 0x007c, NtCancelWaitCompletionPacket, 8 ) \
++    SYSCALL_ENTRY( 0x007d, NtCommitTransaction, 8 ) \
++    SYSCALL_ENTRY( 0x007e, NtCompareObjects, 8 ) \
++    SYSCALL_ENTRY( 0x007f, NtCompareTokens, 12 ) \
++    SYSCALL_ENTRY( 0x0080, NtCompleteConnectPort, 4 ) \
++    SYSCALL_ENTRY( 0x0081, NtConnectPort, 32 ) \
++    SYSCALL_ENTRY( 0x0082, NtContinueEx, 8 ) \
++    SYSCALL_ENTRY( 0x0083, NtConvertBetweenAuxiliaryCounterAndPerformanceCounter, 16 ) \
++    SYSCALL_ENTRY( 0x0084, NtCreateDirectoryObject, 12 ) \
++    SYSCALL_ENTRY( 0x0085, NtCreateIoCompletion, 16 ) \
++    SYSCALL_ENTRY( 0x0086, NtCreateJobObject, 12 ) \
++    SYSCALL_ENTRY( 0x0087, NtCreateKeyTransacted, 32 ) \
++    SYSCALL_ENTRY( 0x0088, NtCreateKeyedEvent, 16 ) \
++    SYSCALL_ENTRY( 0x0089, NtCreateLowBoxToken, 36 ) \
++    SYSCALL_ENTRY( 0x008a, NtCreateMailslotFile, 32 ) \
++    SYSCALL_ENTRY( 0x008b, NtCreateMutant, 16 ) \
++    SYSCALL_ENTRY( 0x008c, NtCreateNamedPipeFile, 56 ) \
++    SYSCALL_ENTRY( 0x008d, NtCreatePagingFile, 16 ) \
++    SYSCALL_ENTRY( 0x008e, NtCreatePort, 20 ) \
++    SYSCALL_ENTRY( 0x008f, NtCreateSectionEx, 36 ) \
++    SYSCALL_ENTRY( 0x0090, NtCreateSemaphore, 20 ) \
++    SYSCALL_ENTRY( 0x0091, NtCreateSymbolicLinkObject, 16 ) \
++    SYSCALL_ENTRY( 0x0092, NtCreateThreadEx, 44 ) \
++    SYSCALL_ENTRY( 0x0093, NtCreateTimer, 16 ) \
++    SYSCALL_ENTRY( 0x0094, NtCreateToken, 52 ) \
++    SYSCALL_ENTRY( 0x0095, NtCreateTransaction, 40 ) \
++    SYSCALL_ENTRY( 0x0096, NtCreateUserProcess, 44 ) \
++    SYSCALL_ENTRY( 0x0097, NtCreateWaitCompletionPacket, 12 ) \
++    SYSCALL_ENTRY( 0x0098, NtDebugActiveProcess, 8 ) \
++    SYSCALL_ENTRY( 0x0099, NtDebugContinue, 12 ) \
++    SYSCALL_ENTRY( 0x009a, NtDeleteAtom, 4 ) \
++    SYSCALL_ENTRY( 0x009b, NtDeleteFile, 4 ) \
++    SYSCALL_ENTRY( 0x009c, NtDeleteKey, 4 ) \
++    SYSCALL_ENTRY( 0x009d, NtDeleteValueKey, 8 ) \
++    SYSCALL_ENTRY( 0x009e, NtDisplayString, 4 ) \
++    SYSCALL_ENTRY( 0x009f, NtFilterToken, 24 ) \
++    SYSCALL_ENTRY( 0x00a0, NtFlushBuffersFileEx, 20 ) \
++    SYSCALL_ENTRY( 0x00a1, NtFlushInstructionCache, 12 ) \
++    SYSCALL_ENTRY( 0x00a2, NtFlushKey, 4 ) \
++    SYSCALL_ENTRY( 0x00a3, NtFlushProcessWriteBuffers, 0 ) \
++    SYSCALL_ENTRY( 0x00a4, NtFlushVirtualMemory, 16 ) \
++    SYSCALL_ENTRY( 0x00a5, NtGetContextThread, 8 ) \
+     SYSCALL_ENTRY( 0x00a6, NtCreateDebugObject, 16 ) \
+-    SYSCALL_ENTRY( 0x00a7, NtGetWriteWatch, 28 ) \
+-    SYSCALL_ENTRY( 0x00a8, NtImpersonateAnonymousToken, 4 ) \
+-    SYSCALL_ENTRY( 0x00a9, NtInitializeNlsFiles, 12 ) \
+-    SYSCALL_ENTRY( 0x00aa, NtInitiatePowerAction, 16 ) \
+-    SYSCALL_ENTRY( 0x00ab, NtListenPort, 8 ) \
+-    SYSCALL_ENTRY( 0x00ac, NtLoadDriver, 4 ) \
+-    SYSCALL_ENTRY( 0x00ad, NtLoadKey, 8 ) \
+-    SYSCALL_ENTRY( 0x00ae, NtLoadKey2, 12 ) \
+-    SYSCALL_ENTRY( 0x00af, NtLoadKeyEx, 32 ) \
+-    SYSCALL_ENTRY( 0x00b0, NtLockFile, 40 ) \
+-    SYSCALL_ENTRY( 0x00b1, NtLockVirtualMemory, 16 ) \
+-    SYSCALL_ENTRY( 0x00b2, NtMakePermanentObject, 4 ) \
+-    SYSCALL_ENTRY( 0x00b3, NtMakeTemporaryObject, 4 ) \
+-    SYSCALL_ENTRY( 0x00b4, NtMapViewOfSectionEx, 36 ) \
+-    SYSCALL_ENTRY( 0x00b5, NtNotifyChangeDirectoryFile, 36 ) \
+-    SYSCALL_ENTRY( 0x00b6, NtNotifyChangeKey, 40 ) \
+-    SYSCALL_ENTRY( 0x00b7, NtNotifyChangeMultipleKeys, 48 ) \
+-    SYSCALL_ENTRY( 0x00b8, NtOpenIoCompletion, 12 ) \
+-    SYSCALL_ENTRY( 0x00b9, NtOpenJobObject, 12 ) \
+-    SYSCALL_ENTRY( 0x00ba, NtOpenKeyEx, 16 ) \
+-    SYSCALL_ENTRY( 0x00bb, NtOpenKeyTransacted, 16 ) \
+-    SYSCALL_ENTRY( 0x00bc, NtOpenKeyTransactedEx, 20 ) \
+-    SYSCALL_ENTRY( 0x00bd, NtOpenKeyedEvent, 12 ) \
+-    SYSCALL_ENTRY( 0x00be, NtOpenMutant, 12 ) \
+-    SYSCALL_ENTRY( 0x00bf, NtOpenProcessToken, 12 ) \
+-    SYSCALL_ENTRY( 0x00c0, NtOpenSemaphore, 12 ) \
+-    SYSCALL_ENTRY( 0x00c1, NtOpenSymbolicLinkObject, 12 ) \
+-    SYSCALL_ENTRY( 0x00c2, NtOpenThread, 16 ) \
+-    SYSCALL_ENTRY( 0x00c3, NtOpenTimer, 12 ) \
+-    SYSCALL_ENTRY( 0x00c4, NtPrivilegeCheck, 12 ) \
+-    SYSCALL_ENTRY( 0x00c5, NtPulseEvent, 8 ) \
+-    SYSCALL_ENTRY( 0x00c6, NtQueryDirectoryObject, 28 ) \
+-    SYSCALL_ENTRY( 0x00c7, NtQueryEaFile, 36 ) \
+-    SYSCALL_ENTRY( 0x00c8, NtQueryFullAttributesFile, 8 ) \
+-    SYSCALL_ENTRY( 0x00c9, NtQueryInformationAtom, 20 ) \
+-    SYSCALL_ENTRY( 0x00ca, NtQueryInformationJobObject, 20 ) \
+-    SYSCALL_ENTRY( 0x00cb, NtQueryInstallUILanguage, 4 ) \
+-    SYSCALL_ENTRY( 0x00cc, NtQueryIoCompletion, 20 ) \
+-    SYSCALL_ENTRY( 0x00cd, NtQueryLicenseValue, 20 ) \
+-    SYSCALL_ENTRY( 0x00ce, NtQueryMultipleValueKey, 24 ) \
+-    SYSCALL_ENTRY( 0x00cf, NtQueryMutant, 20 ) \
+-    SYSCALL_ENTRY( 0x00d0, NtQuerySecurityObject, 20 ) \
+-    SYSCALL_ENTRY( 0x00d1, NtQuerySemaphore, 20 ) \
+-    SYSCALL_ENTRY( 0x00d2, NtQuerySymbolicLinkObject, 12 ) \
+-    SYSCALL_ENTRY( 0x00d3, NtQuerySystemEnvironmentValue, 16 ) \
+-    SYSCALL_ENTRY( 0x00d4, NtQuerySystemEnvironmentValueEx, 20 ) \
+-    SYSCALL_ENTRY( 0x00d5, NtQuerySystemInformationEx, 24 ) \
+-    SYSCALL_ENTRY( 0x00d6, NtQueryTimerResolution, 12 ) \
+-    SYSCALL_ENTRY( 0x00d7, NtQueueApcThreadEx, 24 ) \
+-    SYSCALL_ENTRY( 0x00d8, NtQueueApcThreadEx2, 28 ) \
+-    SYSCALL_ENTRY( 0x00d9, NtRaiseException, 12 ) \
+-    SYSCALL_ENTRY( 0x00da, NtRaiseHardError, 24 ) \
+-    SYSCALL_ENTRY( 0x00db, NtRegisterThreadTerminatePort, 4 ) \
+-    SYSCALL_ENTRY( 0x00dc, NtReleaseKeyedEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x00dd, NtRemoveIoCompletionEx, 24 ) \
+-    SYSCALL_ENTRY( 0x00de, NtRemoveProcessDebug, 8 ) \
+-    SYSCALL_ENTRY( 0x00df, NtRenameKey, 8 ) \
+-    SYSCALL_ENTRY( 0x00e0, NtReplaceKey, 12 ) \
+-    SYSCALL_ENTRY( 0x00e1, NtResetEvent, 8 ) \
+-    SYSCALL_ENTRY( 0x00e2, NtResetWriteWatch, 12 ) \
+-    SYSCALL_ENTRY( 0x00e3, NtRestoreKey, 12 ) \
+-    SYSCALL_ENTRY( 0x00e4, NtResumeProcess, 4 ) \
+-    SYSCALL_ENTRY( 0x00e5, NtRollbackTransaction, 8 ) \
+-    SYSCALL_ENTRY( 0x00e6, NtSaveKey, 8 ) \
+-    SYSCALL_ENTRY( 0x00e7, NtSecureConnectPort, 36 ) \
+-    SYSCALL_ENTRY( 0x00e8, NtSetContextThread, 8 ) \
+-    SYSCALL_ENTRY( 0x00e9, NtSetDebugFilterState, 12 ) \
+-    SYSCALL_ENTRY( 0x00ea, NtSetDefaultLocale, 8 ) \
+-    SYSCALL_ENTRY( 0x00eb, NtSetDefaultUILanguage, 4 ) \
+-    SYSCALL_ENTRY( 0x00ec, NtSetEaFile, 16 ) \
+-    SYSCALL_ENTRY( 0x00ed, NtSetInformationDebugObject, 20 ) \
+-    SYSCALL_ENTRY( 0x00ee, NtSetInformationJobObject, 16 ) \
+-    SYSCALL_ENTRY( 0x00ef, NtSetInformationKey, 16 ) \
+-    SYSCALL_ENTRY( 0x00f0, NtSetInformationToken, 16 ) \
+-    SYSCALL_ENTRY( 0x00f1, NtSetInformationVirtualMemory, 24 ) \
+-    SYSCALL_ENTRY( 0x00f2, NtSetIntervalProfile, 8 ) \
+-    SYSCALL_ENTRY( 0x00f3, NtSetIoCompletion, 20 ) \
+-    SYSCALL_ENTRY( 0x00f4, NtSetIoCompletionEx, 24 ) \
+-    SYSCALL_ENTRY( 0x00f5, NtSetLdtEntries, 24 ) \
+-    SYSCALL_ENTRY( 0x00f6, NtSetSecurityObject, 12 ) \
+-    SYSCALL_ENTRY( 0x00f7, NtSetSystemInformation, 12 ) \
+-    SYSCALL_ENTRY( 0x00f8, NtSetSystemTime, 8 ) \
+-    SYSCALL_ENTRY( 0x00f9, NtSetThreadExecutionState, 8 ) \
+-    SYSCALL_ENTRY( 0x00fa, NtSetTimerResolution, 12 ) \
+-    SYSCALL_ENTRY( 0x00fb, NtSetVolumeInformationFile, 20 ) \
+-    SYSCALL_ENTRY( 0x00fc, NtShutdownSystem, 4 ) \
+-    SYSCALL_ENTRY( 0x00fd, NtSignalAndWaitForSingleObject, 16 ) \
+-    SYSCALL_ENTRY( 0x00fe, NtSuspendProcess, 4 ) \
+-    SYSCALL_ENTRY( 0x00ff, NtSuspendThread, 8 ) \
+-    SYSCALL_ENTRY( 0x0100, NtSystemDebugControl, 24 ) \
+-    SYSCALL_ENTRY( 0x0101, NtTerminateJobObject, 8 ) \
+-    SYSCALL_ENTRY( 0x0102, NtTestAlert, 0 ) \
+-    SYSCALL_ENTRY( 0x0103, NtTraceControl, 24 ) \
+-    SYSCALL_ENTRY( 0x0104, NtUnloadDriver, 4 ) \
+-    SYSCALL_ENTRY( 0x0105, NtUnloadKey, 4 ) \
+-    SYSCALL_ENTRY( 0x0106, NtUnlockFile, 20 ) \
+-    SYSCALL_ENTRY( 0x0107, NtUnlockVirtualMemory, 16 ) \
+-    SYSCALL_ENTRY( 0x0108, NtUnmapViewOfSectionEx, 12 ) \
+-    SYSCALL_ENTRY( 0x0109, NtWaitForAlertByThreadId, 8 ) \
+-    SYSCALL_ENTRY( 0x010a, NtWaitForDebugEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x010b, NtWaitForKeyedEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x010c, NtWow64AllocateVirtualMemory64, 28 ) \
+-    SYSCALL_ENTRY( 0x010d, NtWow64GetNativeSystemInformation, 16 ) \
+-    SYSCALL_ENTRY( 0x010e, NtWow64IsProcessorFeaturePresent, 4 ) \
+-    SYSCALL_ENTRY( 0x010f, NtWow64QueryInformationProcess64, 20 ) \
+-    SYSCALL_ENTRY( 0x0110, NtWow64ReadVirtualMemory64, 28 ) \
+-    SYSCALL_ENTRY( 0x0111, NtWow64WriteVirtualMemory64, 28 )
++    SYSCALL_ENTRY( 0x00a7, NtGetCurrentProcessorNumber, 0 ) \
++    SYSCALL_ENTRY( 0x00a8, NtGetNextProcess, 20 ) \
++    SYSCALL_ENTRY( 0x00a9, NtGetNextThread, 24 ) \
++    SYSCALL_ENTRY( 0x00aa, NtGetNlsSectionPtr, 20 ) \
++    SYSCALL_ENTRY( 0x00ab, NtGetWriteWatch, 28 ) \
++    SYSCALL_ENTRY( 0x00ac, NtImpersonateAnonymousToken, 4 ) \
++    SYSCALL_ENTRY( 0x00ad, NtInitializeNlsFiles, 12 ) \
++    SYSCALL_ENTRY( 0x00ae, NtInitiatePowerAction, 16 ) \
++    SYSCALL_ENTRY( 0x00af, NtListenPort, 8 ) \
++    SYSCALL_ENTRY( 0x00b0, NtLoadDriver, 4 ) \
++    SYSCALL_ENTRY( 0x00b1, NtLoadKey, 8 ) \
++    SYSCALL_ENTRY( 0x00b2, NtLoadKey2, 12 ) \
++    SYSCALL_ENTRY( 0x00b3, NtLoadKeyEx, 32 ) \
++    SYSCALL_ENTRY( 0x00b4, NtLockFile, 40 ) \
++    SYSCALL_ENTRY( 0x00b5, NtLockVirtualMemory, 16 ) \
++    SYSCALL_ENTRY( 0x00b6, NtMakePermanentObject, 4 ) \
++    SYSCALL_ENTRY( 0x00b7, NtMakeTemporaryObject, 4 ) \
++    SYSCALL_ENTRY( 0x00b8, NtMapViewOfSectionEx, 36 ) \
++    SYSCALL_ENTRY( 0x00b9, NtNotifyChangeDirectoryFile, 36 ) \
++    SYSCALL_ENTRY( 0x00ba, NtNotifyChangeKey, 40 ) \
++    SYSCALL_ENTRY( 0x00bb, NtNotifyChangeMultipleKeys, 48 ) \
++    SYSCALL_ENTRY( 0x00bc, NtOpenIoCompletion, 12 ) \
++    SYSCALL_ENTRY( 0x00bd, NtOpenJobObject, 12 ) \
++    SYSCALL_ENTRY( 0x00be, NtOpenKeyEx, 16 ) \
++    SYSCALL_ENTRY( 0x00bf, NtOpenKeyTransacted, 16 ) \
++    SYSCALL_ENTRY( 0x00c0, NtOpenKeyTransactedEx, 20 ) \
++    SYSCALL_ENTRY( 0x00c1, NtOpenKeyedEvent, 12 ) \
++    SYSCALL_ENTRY( 0x00c2, NtOpenMutant, 12 ) \
++    SYSCALL_ENTRY( 0x00c3, NtOpenProcessToken, 12 ) \
++    SYSCALL_ENTRY( 0x00c4, NtOpenSemaphore, 12 ) \
++    SYSCALL_ENTRY( 0x00c5, NtOpenSymbolicLinkObject, 12 ) \
++    SYSCALL_ENTRY( 0x00c6, NtOpenThread, 16 ) \
++    SYSCALL_ENTRY( 0x00c7, NtOpenTimer, 12 ) \
++    SYSCALL_ENTRY( 0x00c8, NtPrivilegeCheck, 12 ) \
++    SYSCALL_ENTRY( 0x00c9, NtPulseEvent, 8 ) \
++    SYSCALL_ENTRY( 0x00ca, NtQueryDirectoryObject, 28 ) \
++    SYSCALL_ENTRY( 0x00cb, NtQueryEaFile, 36 ) \
++    SYSCALL_ENTRY( 0x00cc, NtQueryFullAttributesFile, 8 ) \
++    SYSCALL_ENTRY( 0x00cd, NtQueryInformationAtom, 20 ) \
++    SYSCALL_ENTRY( 0x00ce, NtQueryInformationJobObject, 20 ) \
++    SYSCALL_ENTRY( 0x00cf, NtQueryInstallUILanguage, 4 ) \
++    SYSCALL_ENTRY( 0x00d0, NtQueryIoCompletion, 20 ) \
++    SYSCALL_ENTRY( 0x00d1, NtQueryLicenseValue, 20 ) \
++    SYSCALL_ENTRY( 0x00d2, NtQueryMultipleValueKey, 24 ) \
++    SYSCALL_ENTRY( 0x00d3, NtQueryMutant, 20 ) \
++    SYSCALL_ENTRY( 0x00d4, NtQuerySecurityObject, 20 ) \
++    SYSCALL_ENTRY( 0x00d5, NtQuerySemaphore, 20 ) \
++    SYSCALL_ENTRY( 0x00d6, NtQuerySymbolicLinkObject, 12 ) \
++    SYSCALL_ENTRY( 0x00d7, NtQuerySystemEnvironmentValue, 16 ) \
++    SYSCALL_ENTRY( 0x00d8, NtQuerySystemEnvironmentValueEx, 20 ) \
++    SYSCALL_ENTRY( 0x00d9, NtQuerySystemInformationEx, 24 ) \
++    SYSCALL_ENTRY( 0x00da, NtQueryTimerResolution, 12 ) \
++    SYSCALL_ENTRY( 0x00db, NtQueueApcThreadEx, 24 ) \
++    SYSCALL_ENTRY( 0x00dc, NtQueueApcThreadEx2, 28 ) \
++    SYSCALL_ENTRY( 0x00dd, NtRaiseException, 12 ) \
++    SYSCALL_ENTRY( 0x00de, NtRaiseHardError, 24 ) \
++    SYSCALL_ENTRY( 0x00df, NtRegisterThreadTerminatePort, 4 ) \
++    SYSCALL_ENTRY( 0x00e0, NtReleaseKeyedEvent, 16 ) \
++    SYSCALL_ENTRY( 0x00e1, NtRemoveIoCompletionEx, 24 ) \
++    SYSCALL_ENTRY( 0x00e2, NtRemoveProcessDebug, 8 ) \
++    SYSCALL_ENTRY( 0x00e3, NtRenameKey, 8 ) \
++    SYSCALL_ENTRY( 0x00e4, NtReplaceKey, 12 ) \
++    SYSCALL_ENTRY( 0x00e5, NtResetEvent, 8 ) \
++    SYSCALL_ENTRY( 0x00e6, NtResetWriteWatch, 12 ) \
++    SYSCALL_ENTRY( 0x00e7, NtRestoreKey, 12 ) \
++    SYSCALL_ENTRY( 0x00e8, NtResumeProcess, 4 ) \
++    SYSCALL_ENTRY( 0x00e9, NtRollbackTransaction, 8 ) \
++    SYSCALL_ENTRY( 0x00ea, NtSaveKey, 8 ) \
++    SYSCALL_ENTRY( 0x00eb, NtSecureConnectPort, 36 ) \
++    SYSCALL_ENTRY( 0x00ec, NtSetContextThread, 8 ) \
++    SYSCALL_ENTRY( 0x00ed, NtSetDebugFilterState, 12 ) \
++    SYSCALL_ENTRY( 0x00ee, NtSetDefaultLocale, 8 ) \
++    SYSCALL_ENTRY( 0x00ef, NtSetDefaultUILanguage, 4 ) \
++    SYSCALL_ENTRY( 0x00f0, NtSetEaFile, 16 ) \
++    SYSCALL_ENTRY( 0x00f1, NtSetInformationDebugObject, 20 ) \
++    SYSCALL_ENTRY( 0x00f2, NtSetInformationJobObject, 16 ) \
++    SYSCALL_ENTRY( 0x00f3, NtSetInformationKey, 16 ) \
++    SYSCALL_ENTRY( 0x00f4, NtSetInformationToken, 16 ) \
++    SYSCALL_ENTRY( 0x00f5, NtSetInformationVirtualMemory, 24 ) \
++    SYSCALL_ENTRY( 0x00f6, NtSetIntervalProfile, 8 ) \
++    SYSCALL_ENTRY( 0x00f7, NtSetIoCompletion, 20 ) \
++    SYSCALL_ENTRY( 0x00f8, NtSetIoCompletionEx, 24 ) \
++    SYSCALL_ENTRY( 0x00f9, NtSetLdtEntries, 24 ) \
++    SYSCALL_ENTRY( 0x00fa, NtSetSecurityObject, 12 ) \
++    SYSCALL_ENTRY( 0x00fb, NtSetSystemInformation, 12 ) \
++    SYSCALL_ENTRY( 0x00fc, NtSetSystemTime, 8 ) \
++    SYSCALL_ENTRY( 0x00fd, NtSetThreadExecutionState, 8 ) \
++    SYSCALL_ENTRY( 0x00fe, NtSetTimerResolution, 12 ) \
++    SYSCALL_ENTRY( 0x00ff, NtSetVolumeInformationFile, 20 ) \
++    SYSCALL_ENTRY( 0x0100, NtShutdownSystem, 4 ) \
++    SYSCALL_ENTRY( 0x0101, NtSignalAndWaitForSingleObject, 16 ) \
++    SYSCALL_ENTRY( 0x0102, NtSuspendProcess, 4 ) \
++    SYSCALL_ENTRY( 0x0103, NtSuspendThread, 8 ) \
++    SYSCALL_ENTRY( 0x0104, NtSystemDebugControl, 24 ) \
++    SYSCALL_ENTRY( 0x0105, NtTerminateJobObject, 8 ) \
++    SYSCALL_ENTRY( 0x0106, NtTestAlert, 0 ) \
++    SYSCALL_ENTRY( 0x0107, NtTraceControl, 24 ) \
++    SYSCALL_ENTRY( 0x0108, NtUnloadDriver, 4 ) \
++    SYSCALL_ENTRY( 0x0109, NtUnloadKey, 4 ) \
++    SYSCALL_ENTRY( 0x010a, NtUnlockFile, 20 ) \
++    SYSCALL_ENTRY( 0x010b, NtUnlockVirtualMemory, 16 ) \
++    SYSCALL_ENTRY( 0x010c, NtUnmapViewOfSectionEx, 12 ) \
++    SYSCALL_ENTRY( 0x010d, NtWaitForAlertByThreadId, 8 ) \
++    SYSCALL_ENTRY( 0x010e, NtWaitForDebugEvent, 16 ) \
++    SYSCALL_ENTRY( 0x010f, NtWaitForKeyedEvent, 16 ) \
++    SYSCALL_ENTRY( 0x0110, NtWow64AllocateVirtualMemory64, 28 ) \
++    SYSCALL_ENTRY( 0x0111, NtWow64GetNativeSystemInformation, 16 ) \
++    SYSCALL_ENTRY( 0x0112, NtWow64IsProcessorFeaturePresent, 4 ) \
++    SYSCALL_ENTRY( 0x0113, NtWow64QueryInformationProcess64, 20 ) \
++    SYSCALL_ENTRY( 0x0114, NtWow64ReadVirtualMemory64, 28 ) \
++    SYSCALL_ENTRY( 0x0115, NtWow64WriteVirtualMemory64, 28 )
+ #ifdef _WIN64
+ #define ALL_SYSCALLS \
+     SYSCALL_ENTRY( 0x0000, NtAccessCheck, 64 ) \
+@@ -388,163 +392,167 @@
+     SYSCALL_ENTRY( 0x006c, NtAlpcAcceptConnectPort, 72 ) \
+     SYSCALL_ENTRY( 0x006d, NtAlpcConnectPort, 88 ) \
+     SYSCALL_ENTRY( 0x006e, NtAlpcCreatePort, 24 ) \
+-    SYSCALL_ENTRY( 0x006f, NtAlpcDisconnectPort, 16 ) \
+-    SYSCALL_ENTRY( 0x0070, NtAlpcImpersonateClientOfPort, 24 ) \
+-    SYSCALL_ENTRY( 0x0071, NtAlpcQueryInformation, 40 ) \
+-    SYSCALL_ENTRY( 0x0072, NtAlpcSendWaitReceivePort, 64 ) \
+-    SYSCALL_ENTRY( 0x0073, NtAreMappedFilesTheSame, 16 ) \
+-    SYSCALL_ENTRY( 0x0074, NtAssignProcessToJobObject, 16 ) \
+-    SYSCALL_ENTRY( 0x0075, NtAssociateWaitCompletionPacket, 64 ) \
+-    SYSCALL_ENTRY( 0x0076, NtCancelIoFileEx, 24 ) \
+-    SYSCALL_ENTRY( 0x0077, NtCancelSynchronousIoFile, 24 ) \
+-    SYSCALL_ENTRY( 0x0078, NtCancelWaitCompletionPacket, 16 ) \
+-    SYSCALL_ENTRY( 0x0079, NtCommitTransaction, 16 ) \
+-    SYSCALL_ENTRY( 0x007a, NtCompareObjects, 16 ) \
+-    SYSCALL_ENTRY( 0x007b, NtCompareTokens, 24 ) \
+-    SYSCALL_ENTRY( 0x007c, NtCompleteConnectPort, 8 ) \
+-    SYSCALL_ENTRY( 0x007d, NtConnectPort, 64 ) \
+-    SYSCALL_ENTRY( 0x007e, NtContinueEx, 16 ) \
+-    SYSCALL_ENTRY( 0x007f, NtConvertBetweenAuxiliaryCounterAndPerformanceCounter, 32 ) \
+-    SYSCALL_ENTRY( 0x0080, NtCreateDirectoryObject, 24 ) \
+-    SYSCALL_ENTRY( 0x0081, NtCreateIoCompletion, 32 ) \
+-    SYSCALL_ENTRY( 0x0082, NtCreateJobObject, 24 ) \
+-    SYSCALL_ENTRY( 0x0083, NtCreateKeyTransacted, 64 ) \
+-    SYSCALL_ENTRY( 0x0084, NtCreateKeyedEvent, 32 ) \
+-    SYSCALL_ENTRY( 0x0085, NtCreateLowBoxToken, 72 ) \
+-    SYSCALL_ENTRY( 0x0086, NtCreateMailslotFile, 64 ) \
+-    SYSCALL_ENTRY( 0x0087, NtCreateMutant, 32 ) \
+-    SYSCALL_ENTRY( 0x0088, NtCreateNamedPipeFile, 112 ) \
+-    SYSCALL_ENTRY( 0x0089, NtCreatePagingFile, 32 ) \
+-    SYSCALL_ENTRY( 0x008a, NtCreatePort, 40 ) \
+-    SYSCALL_ENTRY( 0x008b, NtCreateSectionEx, 72 ) \
+-    SYSCALL_ENTRY( 0x008c, NtCreateSemaphore, 40 ) \
+-    SYSCALL_ENTRY( 0x008d, NtCreateSymbolicLinkObject, 32 ) \
+-    SYSCALL_ENTRY( 0x008e, NtCreateThreadEx, 88 ) \
+-    SYSCALL_ENTRY( 0x008f, NtCreateTimer, 32 ) \
+-    SYSCALL_ENTRY( 0x0090, NtCreateToken, 104 ) \
+-    SYSCALL_ENTRY( 0x0091, NtCreateTransaction, 80 ) \
+-    SYSCALL_ENTRY( 0x0092, NtCreateUserProcess, 88 ) \
+-    SYSCALL_ENTRY( 0x0093, NtCreateWaitCompletionPacket, 24 ) \
+-    SYSCALL_ENTRY( 0x0094, NtDebugActiveProcess, 16 ) \
+-    SYSCALL_ENTRY( 0x0095, NtDebugContinue, 24 ) \
+-    SYSCALL_ENTRY( 0x0096, NtDeleteAtom, 8 ) \
+-    SYSCALL_ENTRY( 0x0097, NtDeleteFile, 8 ) \
+-    SYSCALL_ENTRY( 0x0098, NtDeleteKey, 8 ) \
+-    SYSCALL_ENTRY( 0x0099, NtDeleteValueKey, 16 ) \
+-    SYSCALL_ENTRY( 0x009a, NtDisplayString, 8 ) \
+-    SYSCALL_ENTRY( 0x009b, NtFilterToken, 48 ) \
+-    SYSCALL_ENTRY( 0x009c, NtFlushBuffersFileEx, 40 ) \
+-    SYSCALL_ENTRY( 0x009d, NtFlushInstructionCache, 24 ) \
+-    SYSCALL_ENTRY( 0x009e, NtFlushKey, 8 ) \
+-    SYSCALL_ENTRY( 0x009f, NtFlushProcessWriteBuffers, 0 ) \
+-    SYSCALL_ENTRY( 0x00a0, NtFlushVirtualMemory, 32 ) \
+-    SYSCALL_ENTRY( 0x00a1, NtGetContextThread, 16 ) \
+-    SYSCALL_ENTRY( 0x00a2, NtGetCurrentProcessorNumber, 0 ) \
+-    SYSCALL_ENTRY( 0x00a3, NtGetNextProcess, 40 ) \
+-    SYSCALL_ENTRY( 0x00a4, NtGetNextThread, 48 ) \
+-    SYSCALL_ENTRY( 0x00a5, NtGetNlsSectionPtr, 40 ) \
++    SYSCALL_ENTRY( 0x006f, NtAlpcCreatePortSection, 48 ) \
++    SYSCALL_ENTRY( 0x0070, NtAlpcCreateSectionView, 24 ) \
++    SYSCALL_ENTRY( 0x0071, NtAlpcDeletePortSection, 24 ) \
++    SYSCALL_ENTRY( 0x0072, NtAlpcDeleteSectionView, 24 ) \
++    SYSCALL_ENTRY( 0x0073, NtAlpcDisconnectPort, 16 ) \
++    SYSCALL_ENTRY( 0x0074, NtAlpcImpersonateClientOfPort, 24 ) \
++    SYSCALL_ENTRY( 0x0075, NtAlpcQueryInformation, 40 ) \
++    SYSCALL_ENTRY( 0x0076, NtAlpcSendWaitReceivePort, 64 ) \
++    SYSCALL_ENTRY( 0x0077, NtAreMappedFilesTheSame, 16 ) \
++    SYSCALL_ENTRY( 0x0078, NtAssignProcessToJobObject, 16 ) \
++    SYSCALL_ENTRY( 0x0079, NtAssociateWaitCompletionPacket, 64 ) \
++    SYSCALL_ENTRY( 0x007a, NtCancelIoFileEx, 24 ) \
++    SYSCALL_ENTRY( 0x007b, NtCancelSynchronousIoFile, 24 ) \
++    SYSCALL_ENTRY( 0x007c, NtCancelWaitCompletionPacket, 16 ) \
++    SYSCALL_ENTRY( 0x007d, NtCommitTransaction, 16 ) \
++    SYSCALL_ENTRY( 0x007e, NtCompareObjects, 16 ) \
++    SYSCALL_ENTRY( 0x007f, NtCompareTokens, 24 ) \
++    SYSCALL_ENTRY( 0x0080, NtCompleteConnectPort, 8 ) \
++    SYSCALL_ENTRY( 0x0081, NtConnectPort, 64 ) \
++    SYSCALL_ENTRY( 0x0082, NtContinueEx, 16 ) \
++    SYSCALL_ENTRY( 0x0083, NtConvertBetweenAuxiliaryCounterAndPerformanceCounter, 32 ) \
++    SYSCALL_ENTRY( 0x0084, NtCreateDirectoryObject, 24 ) \
++    SYSCALL_ENTRY( 0x0085, NtCreateIoCompletion, 32 ) \
++    SYSCALL_ENTRY( 0x0086, NtCreateJobObject, 24 ) \
++    SYSCALL_ENTRY( 0x0087, NtCreateKeyTransacted, 64 ) \
++    SYSCALL_ENTRY( 0x0088, NtCreateKeyedEvent, 32 ) \
++    SYSCALL_ENTRY( 0x0089, NtCreateLowBoxToken, 72 ) \
++    SYSCALL_ENTRY( 0x008a, NtCreateMailslotFile, 64 ) \
++    SYSCALL_ENTRY( 0x008b, NtCreateMutant, 32 ) \
++    SYSCALL_ENTRY( 0x008c, NtCreateNamedPipeFile, 112 ) \
++    SYSCALL_ENTRY( 0x008d, NtCreatePagingFile, 32 ) \
++    SYSCALL_ENTRY( 0x008e, NtCreatePort, 40 ) \
++    SYSCALL_ENTRY( 0x008f, NtCreateSectionEx, 72 ) \
++    SYSCALL_ENTRY( 0x0090, NtCreateSemaphore, 40 ) \
++    SYSCALL_ENTRY( 0x0091, NtCreateSymbolicLinkObject, 32 ) \
++    SYSCALL_ENTRY( 0x0092, NtCreateThreadEx, 88 ) \
++    SYSCALL_ENTRY( 0x0093, NtCreateTimer, 32 ) \
++    SYSCALL_ENTRY( 0x0094, NtCreateToken, 104 ) \
++    SYSCALL_ENTRY( 0x0095, NtCreateTransaction, 80 ) \
++    SYSCALL_ENTRY( 0x0096, NtCreateUserProcess, 88 ) \
++    SYSCALL_ENTRY( 0x0097, NtCreateWaitCompletionPacket, 24 ) \
++    SYSCALL_ENTRY( 0x0098, NtDebugActiveProcess, 16 ) \
++    SYSCALL_ENTRY( 0x0099, NtDebugContinue, 24 ) \
++    SYSCALL_ENTRY( 0x009a, NtDeleteAtom, 8 ) \
++    SYSCALL_ENTRY( 0x009b, NtDeleteFile, 8 ) \
++    SYSCALL_ENTRY( 0x009c, NtDeleteKey, 8 ) \
++    SYSCALL_ENTRY( 0x009d, NtDeleteValueKey, 16 ) \
++    SYSCALL_ENTRY( 0x009e, NtDisplayString, 8 ) \
++    SYSCALL_ENTRY( 0x009f, NtFilterToken, 48 ) \
++    SYSCALL_ENTRY( 0x00a0, NtFlushBuffersFileEx, 40 ) \
++    SYSCALL_ENTRY( 0x00a1, NtFlushInstructionCache, 24 ) \
++    SYSCALL_ENTRY( 0x00a2, NtFlushKey, 8 ) \
++    SYSCALL_ENTRY( 0x00a3, NtFlushProcessWriteBuffers, 0 ) \
++    SYSCALL_ENTRY( 0x00a4, NtFlushVirtualMemory, 32 ) \
++    SYSCALL_ENTRY( 0x00a5, NtGetContextThread, 16 ) \
+     SYSCALL_ENTRY( 0x00a6, NtCreateDebugObject, 32 ) \
+-    SYSCALL_ENTRY( 0x00a7, NtGetWriteWatch, 56 ) \
+-    SYSCALL_ENTRY( 0x00a8, NtImpersonateAnonymousToken, 8 ) \
+-    SYSCALL_ENTRY( 0x00a9, NtInitializeNlsFiles, 24 ) \
+-    SYSCALL_ENTRY( 0x00aa, NtInitiatePowerAction, 32 ) \
+-    SYSCALL_ENTRY( 0x00ab, NtListenPort, 16 ) \
+-    SYSCALL_ENTRY( 0x00ac, NtLoadDriver, 8 ) \
+-    SYSCALL_ENTRY( 0x00ad, NtLoadKey, 16 ) \
+-    SYSCALL_ENTRY( 0x00ae, NtLoadKey2, 24 ) \
+-    SYSCALL_ENTRY( 0x00af, NtLoadKeyEx, 64 ) \
+-    SYSCALL_ENTRY( 0x00b0, NtLockFile, 80 ) \
+-    SYSCALL_ENTRY( 0x00b1, NtLockVirtualMemory, 32 ) \
+-    SYSCALL_ENTRY( 0x00b2, NtMakePermanentObject, 8 ) \
+-    SYSCALL_ENTRY( 0x00b3, NtMakeTemporaryObject, 8 ) \
+-    SYSCALL_ENTRY( 0x00b4, NtMapViewOfSectionEx, 72 ) \
+-    SYSCALL_ENTRY( 0x00b5, NtNotifyChangeDirectoryFile, 72 ) \
+-    SYSCALL_ENTRY( 0x00b6, NtNotifyChangeKey, 80 ) \
+-    SYSCALL_ENTRY( 0x00b7, NtNotifyChangeMultipleKeys, 96 ) \
+-    SYSCALL_ENTRY( 0x00b8, NtOpenIoCompletion, 24 ) \
+-    SYSCALL_ENTRY( 0x00b9, NtOpenJobObject, 24 ) \
+-    SYSCALL_ENTRY( 0x00ba, NtOpenKeyEx, 32 ) \
+-    SYSCALL_ENTRY( 0x00bb, NtOpenKeyTransacted, 32 ) \
+-    SYSCALL_ENTRY( 0x00bc, NtOpenKeyTransactedEx, 40 ) \
+-    SYSCALL_ENTRY( 0x00bd, NtOpenKeyedEvent, 24 ) \
+-    SYSCALL_ENTRY( 0x00be, NtOpenMutant, 24 ) \
+-    SYSCALL_ENTRY( 0x00bf, NtOpenProcessToken, 24 ) \
+-    SYSCALL_ENTRY( 0x00c0, NtOpenSemaphore, 24 ) \
+-    SYSCALL_ENTRY( 0x00c1, NtOpenSymbolicLinkObject, 24 ) \
+-    SYSCALL_ENTRY( 0x00c2, NtOpenThread, 32 ) \
+-    SYSCALL_ENTRY( 0x00c3, NtOpenTimer, 24 ) \
+-    SYSCALL_ENTRY( 0x00c4, NtPrivilegeCheck, 24 ) \
+-    SYSCALL_ENTRY( 0x00c5, NtPulseEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x00c6, NtQueryDirectoryObject, 56 ) \
+-    SYSCALL_ENTRY( 0x00c7, NtQueryEaFile, 72 ) \
+-    SYSCALL_ENTRY( 0x00c8, NtQueryFullAttributesFile, 16 ) \
+-    SYSCALL_ENTRY( 0x00c9, NtQueryInformationAtom, 40 ) \
+-    SYSCALL_ENTRY( 0x00ca, NtQueryInformationJobObject, 40 ) \
+-    SYSCALL_ENTRY( 0x00cb, NtQueryInstallUILanguage, 8 ) \
+-    SYSCALL_ENTRY( 0x00cc, NtQueryIoCompletion, 40 ) \
+-    SYSCALL_ENTRY( 0x00cd, NtQueryLicenseValue, 40 ) \
+-    SYSCALL_ENTRY( 0x00ce, NtQueryMultipleValueKey, 48 ) \
+-    SYSCALL_ENTRY( 0x00cf, NtQueryMutant, 40 ) \
+-    SYSCALL_ENTRY( 0x00d0, NtQuerySecurityObject, 40 ) \
+-    SYSCALL_ENTRY( 0x00d1, NtQuerySemaphore, 40 ) \
+-    SYSCALL_ENTRY( 0x00d2, NtQuerySymbolicLinkObject, 24 ) \
+-    SYSCALL_ENTRY( 0x00d3, NtQuerySystemEnvironmentValue, 32 ) \
+-    SYSCALL_ENTRY( 0x00d4, NtQuerySystemEnvironmentValueEx, 40 ) \
+-    SYSCALL_ENTRY( 0x00d5, NtQuerySystemInformationEx, 48 ) \
+-    SYSCALL_ENTRY( 0x00d6, NtQueryTimerResolution, 24 ) \
+-    SYSCALL_ENTRY( 0x00d7, NtQueueApcThreadEx, 48 ) \
+-    SYSCALL_ENTRY( 0x00d8, NtQueueApcThreadEx2, 56 ) \
+-    SYSCALL_ENTRY( 0x00d9, NtRaiseException, 24 ) \
+-    SYSCALL_ENTRY( 0x00da, NtRaiseHardError, 48 ) \
+-    SYSCALL_ENTRY( 0x00db, NtRegisterThreadTerminatePort, 8 ) \
+-    SYSCALL_ENTRY( 0x00dc, NtReleaseKeyedEvent, 32 ) \
+-    SYSCALL_ENTRY( 0x00dd, NtRemoveIoCompletionEx, 48 ) \
+-    SYSCALL_ENTRY( 0x00de, NtRemoveProcessDebug, 16 ) \
+-    SYSCALL_ENTRY( 0x00df, NtRenameKey, 16 ) \
+-    SYSCALL_ENTRY( 0x00e0, NtReplaceKey, 24 ) \
+-    SYSCALL_ENTRY( 0x00e1, NtResetEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x00e2, NtResetWriteWatch, 24 ) \
+-    SYSCALL_ENTRY( 0x00e3, NtRestoreKey, 24 ) \
+-    SYSCALL_ENTRY( 0x00e4, NtResumeProcess, 8 ) \
+-    SYSCALL_ENTRY( 0x00e5, NtRollbackTransaction, 16 ) \
+-    SYSCALL_ENTRY( 0x00e6, NtSaveKey, 16 ) \
+-    SYSCALL_ENTRY( 0x00e7, NtSecureConnectPort, 72 ) \
+-    SYSCALL_ENTRY( 0x00e8, NtSetContextThread, 16 ) \
+-    SYSCALL_ENTRY( 0x00e9, NtSetDebugFilterState, 24 ) \
+-    SYSCALL_ENTRY( 0x00ea, NtSetDefaultLocale, 16 ) \
+-    SYSCALL_ENTRY( 0x00eb, NtSetDefaultUILanguage, 8 ) \
+-    SYSCALL_ENTRY( 0x00ec, NtSetEaFile, 32 ) \
+-    SYSCALL_ENTRY( 0x00ed, NtSetInformationDebugObject, 40 ) \
+-    SYSCALL_ENTRY( 0x00ee, NtSetInformationJobObject, 32 ) \
+-    SYSCALL_ENTRY( 0x00ef, NtSetInformationKey, 32 ) \
+-    SYSCALL_ENTRY( 0x00f0, NtSetInformationToken, 32 ) \
+-    SYSCALL_ENTRY( 0x00f1, NtSetInformationVirtualMemory, 48 ) \
+-    SYSCALL_ENTRY( 0x00f2, NtSetIntervalProfile, 16 ) \
+-    SYSCALL_ENTRY( 0x00f3, NtSetIoCompletion, 40 ) \
+-    SYSCALL_ENTRY( 0x00f4, NtSetIoCompletionEx, 48 ) \
+-    SYSCALL_ENTRY( 0x00f5, NtSetLdtEntries, 48 ) \
+-    SYSCALL_ENTRY( 0x00f6, NtSetSecurityObject, 24 ) \
+-    SYSCALL_ENTRY( 0x00f7, NtSetSystemInformation, 24 ) \
+-    SYSCALL_ENTRY( 0x00f8, NtSetSystemTime, 16 ) \
+-    SYSCALL_ENTRY( 0x00f9, NtSetThreadExecutionState, 16 ) \
+-    SYSCALL_ENTRY( 0x00fa, NtSetTimerResolution, 24 ) \
+-    SYSCALL_ENTRY( 0x00fb, NtSetVolumeInformationFile, 40 ) \
+-    SYSCALL_ENTRY( 0x00fc, NtShutdownSystem, 8 ) \
+-    SYSCALL_ENTRY( 0x00fd, NtSignalAndWaitForSingleObject, 32 ) \
+-    SYSCALL_ENTRY( 0x00fe, NtSuspendProcess, 8 ) \
+-    SYSCALL_ENTRY( 0x00ff, NtSuspendThread, 16 ) \
+-    SYSCALL_ENTRY( 0x0100, NtSystemDebugControl, 48 ) \
+-    SYSCALL_ENTRY( 0x0101, NtTerminateJobObject, 16 ) \
+-    SYSCALL_ENTRY( 0x0102, NtTestAlert, 0 ) \
+-    SYSCALL_ENTRY( 0x0103, NtTraceControl, 48 ) \
+-    SYSCALL_ENTRY( 0x0104, NtUnloadDriver, 8 ) \
+-    SYSCALL_ENTRY( 0x0105, NtUnloadKey, 8 ) \
+-    SYSCALL_ENTRY( 0x0106, NtUnlockFile, 40 ) \
+-    SYSCALL_ENTRY( 0x0107, NtUnlockVirtualMemory, 32 ) \
+-    SYSCALL_ENTRY( 0x0108, NtUnmapViewOfSectionEx, 24 ) \
+-    SYSCALL_ENTRY( 0x0109, NtWaitForAlertByThreadId, 16 ) \
+-    SYSCALL_ENTRY( 0x010a, NtWaitForDebugEvent, 32 ) \
+-    SYSCALL_ENTRY( 0x010b, NtWaitForKeyedEvent, 32 )
++    SYSCALL_ENTRY( 0x00a7, NtGetCurrentProcessorNumber, 0 ) \
++    SYSCALL_ENTRY( 0x00a8, NtGetNextProcess, 40 ) \
++    SYSCALL_ENTRY( 0x00a9, NtGetNextThread, 48 ) \
++    SYSCALL_ENTRY( 0x00aa, NtGetNlsSectionPtr, 40 ) \
++    SYSCALL_ENTRY( 0x00ab, NtGetWriteWatch, 56 ) \
++    SYSCALL_ENTRY( 0x00ac, NtImpersonateAnonymousToken, 8 ) \
++    SYSCALL_ENTRY( 0x00ad, NtInitializeNlsFiles, 24 ) \
++    SYSCALL_ENTRY( 0x00ae, NtInitiatePowerAction, 32 ) \
++    SYSCALL_ENTRY( 0x00af, NtListenPort, 16 ) \
++    SYSCALL_ENTRY( 0x00b0, NtLoadDriver, 8 ) \
++    SYSCALL_ENTRY( 0x00b1, NtLoadKey, 16 ) \
++    SYSCALL_ENTRY( 0x00b2, NtLoadKey2, 24 ) \
++    SYSCALL_ENTRY( 0x00b3, NtLoadKeyEx, 64 ) \
++    SYSCALL_ENTRY( 0x00b4, NtLockFile, 80 ) \
++    SYSCALL_ENTRY( 0x00b5, NtLockVirtualMemory, 32 ) \
++    SYSCALL_ENTRY( 0x00b6, NtMakePermanentObject, 8 ) \
++    SYSCALL_ENTRY( 0x00b7, NtMakeTemporaryObject, 8 ) \
++    SYSCALL_ENTRY( 0x00b8, NtMapViewOfSectionEx, 72 ) \
++    SYSCALL_ENTRY( 0x00b9, NtNotifyChangeDirectoryFile, 72 ) \
++    SYSCALL_ENTRY( 0x00ba, NtNotifyChangeKey, 80 ) \
++    SYSCALL_ENTRY( 0x00bb, NtNotifyChangeMultipleKeys, 96 ) \
++    SYSCALL_ENTRY( 0x00bc, NtOpenIoCompletion, 24 ) \
++    SYSCALL_ENTRY( 0x00bd, NtOpenJobObject, 24 ) \
++    SYSCALL_ENTRY( 0x00be, NtOpenKeyEx, 32 ) \
++    SYSCALL_ENTRY( 0x00bf, NtOpenKeyTransacted, 32 ) \
++    SYSCALL_ENTRY( 0x00c0, NtOpenKeyTransactedEx, 40 ) \
++    SYSCALL_ENTRY( 0x00c1, NtOpenKeyedEvent, 24 ) \
++    SYSCALL_ENTRY( 0x00c2, NtOpenMutant, 24 ) \
++    SYSCALL_ENTRY( 0x00c3, NtOpenProcessToken, 24 ) \
++    SYSCALL_ENTRY( 0x00c4, NtOpenSemaphore, 24 ) \
++    SYSCALL_ENTRY( 0x00c5, NtOpenSymbolicLinkObject, 24 ) \
++    SYSCALL_ENTRY( 0x00c6, NtOpenThread, 32 ) \
++    SYSCALL_ENTRY( 0x00c7, NtOpenTimer, 24 ) \
++    SYSCALL_ENTRY( 0x00c8, NtPrivilegeCheck, 24 ) \
++    SYSCALL_ENTRY( 0x00c9, NtPulseEvent, 16 ) \
++    SYSCALL_ENTRY( 0x00ca, NtQueryDirectoryObject, 56 ) \
++    SYSCALL_ENTRY( 0x00cb, NtQueryEaFile, 72 ) \
++    SYSCALL_ENTRY( 0x00cc, NtQueryFullAttributesFile, 16 ) \
++    SYSCALL_ENTRY( 0x00cd, NtQueryInformationAtom, 40 ) \
++    SYSCALL_ENTRY( 0x00ce, NtQueryInformationJobObject, 40 ) \
++    SYSCALL_ENTRY( 0x00cf, NtQueryInstallUILanguage, 8 ) \
++    SYSCALL_ENTRY( 0x00d0, NtQueryIoCompletion, 40 ) \
++    SYSCALL_ENTRY( 0x00d1, NtQueryLicenseValue, 40 ) \
++    SYSCALL_ENTRY( 0x00d2, NtQueryMultipleValueKey, 48 ) \
++    SYSCALL_ENTRY( 0x00d3, NtQueryMutant, 40 ) \
++    SYSCALL_ENTRY( 0x00d4, NtQuerySecurityObject, 40 ) \
++    SYSCALL_ENTRY( 0x00d5, NtQuerySemaphore, 40 ) \
++    SYSCALL_ENTRY( 0x00d6, NtQuerySymbolicLinkObject, 24 ) \
++    SYSCALL_ENTRY( 0x00d7, NtQuerySystemEnvironmentValue, 32 ) \
++    SYSCALL_ENTRY( 0x00d8, NtQuerySystemEnvironmentValueEx, 40 ) \
++    SYSCALL_ENTRY( 0x00d9, NtQuerySystemInformationEx, 48 ) \
++    SYSCALL_ENTRY( 0x00da, NtQueryTimerResolution, 24 ) \
++    SYSCALL_ENTRY( 0x00db, NtQueueApcThreadEx, 48 ) \
++    SYSCALL_ENTRY( 0x00dc, NtQueueApcThreadEx2, 56 ) \
++    SYSCALL_ENTRY( 0x00dd, NtRaiseException, 24 ) \
++    SYSCALL_ENTRY( 0x00de, NtRaiseHardError, 48 ) \
++    SYSCALL_ENTRY( 0x00df, NtRegisterThreadTerminatePort, 8 ) \
++    SYSCALL_ENTRY( 0x00e0, NtReleaseKeyedEvent, 32 ) \
++    SYSCALL_ENTRY( 0x00e1, NtRemoveIoCompletionEx, 48 ) \
++    SYSCALL_ENTRY( 0x00e2, NtRemoveProcessDebug, 16 ) \
++    SYSCALL_ENTRY( 0x00e3, NtRenameKey, 16 ) \
++    SYSCALL_ENTRY( 0x00e4, NtReplaceKey, 24 ) \
++    SYSCALL_ENTRY( 0x00e5, NtResetEvent, 16 ) \
++    SYSCALL_ENTRY( 0x00e6, NtResetWriteWatch, 24 ) \
++    SYSCALL_ENTRY( 0x00e7, NtRestoreKey, 24 ) \
++    SYSCALL_ENTRY( 0x00e8, NtResumeProcess, 8 ) \
++    SYSCALL_ENTRY( 0x00e9, NtRollbackTransaction, 16 ) \
++    SYSCALL_ENTRY( 0x00ea, NtSaveKey, 16 ) \
++    SYSCALL_ENTRY( 0x00eb, NtSecureConnectPort, 72 ) \
++    SYSCALL_ENTRY( 0x00ec, NtSetContextThread, 16 ) \
++    SYSCALL_ENTRY( 0x00ed, NtSetDebugFilterState, 24 ) \
++    SYSCALL_ENTRY( 0x00ee, NtSetDefaultLocale, 16 ) \
++    SYSCALL_ENTRY( 0x00ef, NtSetDefaultUILanguage, 8 ) \
++    SYSCALL_ENTRY( 0x00f0, NtSetEaFile, 32 ) \
++    SYSCALL_ENTRY( 0x00f1, NtSetInformationDebugObject, 40 ) \
++    SYSCALL_ENTRY( 0x00f2, NtSetInformationJobObject, 32 ) \
++    SYSCALL_ENTRY( 0x00f3, NtSetInformationKey, 32 ) \
++    SYSCALL_ENTRY( 0x00f4, NtSetInformationToken, 32 ) \
++    SYSCALL_ENTRY( 0x00f5, NtSetInformationVirtualMemory, 48 ) \
++    SYSCALL_ENTRY( 0x00f6, NtSetIntervalProfile, 16 ) \
++    SYSCALL_ENTRY( 0x00f7, NtSetIoCompletion, 40 ) \
++    SYSCALL_ENTRY( 0x00f8, NtSetIoCompletionEx, 48 ) \
++    SYSCALL_ENTRY( 0x00f9, NtSetLdtEntries, 48 ) \
++    SYSCALL_ENTRY( 0x00fa, NtSetSecurityObject, 24 ) \
++    SYSCALL_ENTRY( 0x00fb, NtSetSystemInformation, 24 ) \
++    SYSCALL_ENTRY( 0x00fc, NtSetSystemTime, 16 ) \
++    SYSCALL_ENTRY( 0x00fd, NtSetThreadExecutionState, 16 ) \
++    SYSCALL_ENTRY( 0x00fe, NtSetTimerResolution, 24 ) \
++    SYSCALL_ENTRY( 0x00ff, NtSetVolumeInformationFile, 40 ) \
++    SYSCALL_ENTRY( 0x0100, NtShutdownSystem, 8 ) \
++    SYSCALL_ENTRY( 0x0101, NtSignalAndWaitForSingleObject, 32 ) \
++    SYSCALL_ENTRY( 0x0102, NtSuspendProcess, 8 ) \
++    SYSCALL_ENTRY( 0x0103, NtSuspendThread, 16 ) \
++    SYSCALL_ENTRY( 0x0104, NtSystemDebugControl, 48 ) \
++    SYSCALL_ENTRY( 0x0105, NtTerminateJobObject, 16 ) \
++    SYSCALL_ENTRY( 0x0106, NtTestAlert, 0 ) \
++    SYSCALL_ENTRY( 0x0107, NtTraceControl, 48 ) \
++    SYSCALL_ENTRY( 0x0108, NtUnloadDriver, 8 ) \
++    SYSCALL_ENTRY( 0x0109, NtUnloadKey, 8 ) \
++    SYSCALL_ENTRY( 0x010a, NtUnlockFile, 40 ) \
++    SYSCALL_ENTRY( 0x010b, NtUnlockVirtualMemory, 32 ) \
++    SYSCALL_ENTRY( 0x010c, NtUnmapViewOfSectionEx, 24 ) \
++    SYSCALL_ENTRY( 0x010d, NtWaitForAlertByThreadId, 16 ) \
++    SYSCALL_ENTRY( 0x010e, NtWaitForDebugEvent, 32 ) \
++    SYSCALL_ENTRY( 0x010f, NtWaitForKeyedEvent, 32 )
+ #else
+ #define ALL_SYSCALLS ALL_SYSCALLS32
+ #endif
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index baee1f2..173714e 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -367,6 +367,10 @@ DEFINE_WRAPPED_SYSCALL(NtAllocateVirtualMemoryEx, (HANDLE process, PVOID *ret, S
+ DEFINE_SYSCALL(NtAlpcAcceptConnectPort, (HANDLE *communication_port, HANDLE connection_port, DWORD flags, OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr, void *port_context, ALPC_PORT_MESSAGE *send_msg, ALPC_MESSAGE_ATTRIBUTES *send_msg_attr, BOOLEAN accept))
+ DEFINE_SYSCALL(NtAlpcConnectPort, (HANDLE *port_handle, UNICODE_STRING *port_name, OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr, DWORD flags, PSID required_server_sid, ALPC_PORT_MESSAGE *connect_msg, SIZE_T *connect_msg_size, ALPC_MESSAGE_ATTRIBUTES *send_msg_attr, ALPC_MESSAGE_ATTRIBUTES *recv_msg_attr, LARGE_INTEGER *timeout))
+ DEFINE_SYSCALL(NtAlpcCreatePort, (HANDLE *port_handle, OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr))
++DEFINE_SYSCALL(NtAlpcCreatePortSection, (HANDLE port_handle, ULONG flags, HANDLE section_handle, SIZE_T section_size, HANDLE *alpc_section_handle, SIZE_T *actual_section_size))
++DEFINE_SYSCALL(NtAlpcCreateSectionView, (HANDLE port_handle, ULONG flags, ALPC_DATA_VIEW_ATTR *view_attr))
++DEFINE_SYSCALL(NtAlpcDeletePortSection, (HANDLE port_handle, ULONG flags, HANDLE section_handle))
++DEFINE_SYSCALL(NtAlpcDeleteSectionView, (HANDLE port_handle, ULONG flags, PVOID view_base))
+ DEFINE_SYSCALL(NtAlpcDisconnectPort, (HANDLE port_handle, ULONG flags))
+ DEFINE_SYSCALL(NtAlpcImpersonateClientOfPort, (HANDLE port_handle, ALPC_PORT_MESSAGE *msg, void *reserved ))
+ DEFINE_SYSCALL(NtAlpcSendWaitReceivePort, (HANDLE port_handle, DWORD flags, ALPC_PORT_MESSAGE *send_msg, ALPC_MESSAGE_ATTRIBUTES *send_msg_attr, ALPC_PORT_MESSAGE *recv_msg, SIZE_T *recv_buffer_size, ALPC_MESSAGE_ATTRIBUTES *recv_msg_attr, LARGE_INTEGER *timeout))
+diff --git a/dlls/ntdll/tests/alpc.c b/dlls/ntdll/tests/alpc.c
+index f34da20..d666e1f 100644
+--- a/dlls/ntdll/tests/alpc.c
++++ b/dlls/ntdll/tests/alpc.c
+@@ -29,6 +29,16 @@
+ DECL_FUNCPTR(AlpcGetHeaderSize)
+ DECL_FUNCPTR(AlpcGetMessageAttribute)
+ DECL_FUNCPTR(AlpcInitializeMessageAttribute)
++DECL_FUNCPTR(NtAlpcCreatePort)
++DECL_FUNCPTR(NtAlpcConnectPort)
++DECL_FUNCPTR(NtAlpcAcceptConnectPort)
++DECL_FUNCPTR(NtAlpcDisconnectPort)
++DECL_FUNCPTR(NtAlpcSendWaitReceivePort)
++DECL_FUNCPTR(NtAlpcCreatePortSection)
++DECL_FUNCPTR(NtAlpcDeletePortSection)
++DECL_FUNCPTR(NtAlpcCreateSectionView)
++DECL_FUNCPTR(NtAlpcDeleteSectionView)
++DECL_FUNCPTR(NtClose)
+ 
+ #undef DECL_FUNCPTR
+ 
+@@ -44,6 +54,16 @@ static void init_functions(void)
+     LOAD_FUNCPTR(AlpcGetHeaderSize)
+     LOAD_FUNCPTR(AlpcGetMessageAttribute)
+     LOAD_FUNCPTR(AlpcInitializeMessageAttribute)
++    LOAD_FUNCPTR(NtAlpcCreatePort)
++    LOAD_FUNCPTR(NtAlpcConnectPort)
++    LOAD_FUNCPTR(NtAlpcAcceptConnectPort)
++    LOAD_FUNCPTR(NtAlpcDisconnectPort)
++    LOAD_FUNCPTR(NtAlpcSendWaitReceivePort)
++    LOAD_FUNCPTR(NtAlpcCreatePortSection)
++    LOAD_FUNCPTR(NtAlpcDeletePortSection)
++    LOAD_FUNCPTR(NtAlpcCreateSectionView)
++    LOAD_FUNCPTR(NtAlpcDeleteSectionView)
++    LOAD_FUNCPTR(NtClose)
+ 
+ #undef LOAD_FUNCPTR
+ }
+@@ -342,6 +362,179 @@ static void test_AlpcInitializeMessageAttribute(void)
+     }
+ }
+ 
++static void test_AlpcSectionView(void)
++{
++    HANDLE section = NULL;
++    SIZE_T actual_size = 0;
++    ALPC_DATA_VIEW_ATTR view;
++    NTSTATUS status;
++
++    if (!pNtAlpcCreatePortSection || !pNtAlpcCreateSectionView ||
++        !pNtAlpcDeleteSectionView || !pNtAlpcDeletePortSection)
++    {
++        win_skip("ALPC section view functions are unavailable.\n");
++        return;
++    }
++
++    /* Test invalid parameters */
++    status = pNtAlpcCreatePortSection(NULL, 0, NULL, 0x1000, &section, &actual_size);
++    ok(status == STATUS_INVALID_PARAMETER, "Expected STATUS_INVALID_PARAMETER, got %#lx\n", status);
++
++    status = pNtAlpcCreatePortSection((HANDLE)0x1234, 0, NULL, 0, &section, &actual_size);
++    ok(status == STATUS_INVALID_PARAMETER, "Expected STATUS_INVALID_PARAMETER, got %#lx\n", status);
++
++    /* Test creating port section */
++    status = pNtAlpcCreatePortSection((HANDLE)0x1234, 0, NULL, 0x1000, &section, &actual_size);
++    ok(status == STATUS_SUCCESS, "NtAlpcCreatePortSection failed: %#lx\n", status);
++    ok(section != NULL, "Expected valid section handle\n");
++    ok(actual_size >= 0x1000, "Expected actual_size >= 0x1000, got %Ix\n", actual_size);
++
++    /* Test creating section view */
++    memset(&view, 0, sizeof(view));
++    view.SectionHandle = section;
++    view.ViewSize = 0x1000;
++    status = pNtAlpcCreateSectionView((HANDLE)0x1234, 0, &view);
++    ok(status == STATUS_SUCCESS, "NtAlpcCreateSectionView failed: %#lx\n", status);
++    ok(view.ViewBase != NULL, "Expected non-NULL ViewBase\n");
++    ok(view.ViewSize >= 0x1000, "Expected ViewSize >= 0x1000, got %Ix\n", view.ViewSize);
++
++    /* Test read/write into view memory */
++    strcpy((char *)view.ViewBase, "test view buffer data");
++    ok(!strcmp((char *)view.ViewBase, "test view buffer data"), "View memory content mismatch\n");
++
++    /* Test unmapping view */
++    status = pNtAlpcDeleteSectionView((HANDLE)0x1234, 0, view.ViewBase);
++    ok(status == STATUS_SUCCESS, "NtAlpcDeleteSectionView failed: %#lx\n", status);
++
++    /* Test deleting section */
++    status = pNtAlpcDeletePortSection((HANDLE)0x1234, 0, section);
++    ok(status == STATUS_SUCCESS, "NtAlpcDeletePortSection failed: %#lx\n", status);
++}
++
++static void test_AlpcMessageViewAttribute(void)
++{
++    UNICODE_STRING port_name;
++    OBJECT_ATTRIBUTES obj_attr;
++    ALPC_PORT_ATTRIBUTES port_attr;
++    HANDLE server_port = NULL, client_conn = NULL, server_conn = NULL;
++    HANDLE section = NULL;
++    SIZE_T actual_size = 0;
++    ALPC_DATA_VIEW_ATTR client_view;
++    ALPC_PORT_MESSAGE req_msg;
++    SIZE_T req_size;
++    NTSTATUS status;
++
++    if (!pNtAlpcCreatePort || !pNtAlpcConnectPort || !pNtAlpcAcceptConnectPort ||
++        !pNtAlpcSendWaitReceivePort || !pNtAlpcCreatePortSection ||
++        !pNtAlpcCreateSectionView || !pNtAlpcDeleteSectionView || !pNtAlpcDeletePortSection)
++    {
++        win_skip("ALPC functions are unavailable.\n");
++        return;
++    }
++
++    RtlInitUnicodeString(&port_name, L"\\BaseNamedObjects\\TestAlpcViewPort");
++    InitializeObjectAttributes(&obj_attr, &port_name, 0, NULL, NULL);
++    memset(&port_attr, 0, sizeof(port_attr));
++    port_attr.MaxMessageLength = 0x1000;
++
++    status = pNtAlpcCreatePort(&server_port, &obj_attr, &port_attr);
++    ok(status == STATUS_SUCCESS, "NtAlpcCreatePort failed: %#lx\n", status);
++
++    status = pNtAlpcConnectPort(&client_conn, &port_name, NULL, &port_attr, 0, NULL, NULL, NULL, NULL, NULL, NULL);
++    ok(status == STATUS_SUCCESS || status == STATUS_PENDING, "NtAlpcConnectPort failed: %#lx\n", status);
++
++    memset(&req_msg, 0, sizeof(req_msg));
++    req_size = sizeof(req_msg);
++    status = pNtAlpcSendWaitReceivePort(server_port, 0, NULL, NULL, &req_msg, &req_size, NULL, NULL);
++    ok(status == STATUS_SUCCESS, "Receive connect request failed: %#lx\n", status);
++
++    status = pNtAlpcAcceptConnectPort(&server_conn, server_port, 0, NULL, NULL, NULL, &req_msg, NULL, TRUE);
++    ok(status == STATUS_SUCCESS, "NtAlpcAcceptConnectPort failed: %#lx\n", status);
++
++    /* Create client section and view */
++    status = pNtAlpcCreatePortSection(client_conn, 0, NULL, 0x1000, &section, &actual_size);
++    ok(status == STATUS_SUCCESS, "NtAlpcCreatePortSection failed: %#lx\n", status);
++
++    memset(&client_view, 0, sizeof(client_view));
++    client_view.SectionHandle = section;
++    client_view.ViewSize = 0x1000;
++    status = pNtAlpcCreateSectionView(client_conn, 0, &client_view);
++    ok(status == STATUS_SUCCESS, "NtAlpcCreateSectionView failed: %#lx\n", status);
++    strcpy((char *)client_view.ViewBase, "alpc shared payload 12345");
++
++    /* Client sends message with ALPC_MESSAGE_VIEW_ATTRIBUTE */
++    {
++        char send_buf[sizeof(ALPC_PORT_MESSAGE) + 32];
++        ALPC_PORT_MESSAGE *send_msg = (ALPC_PORT_MESSAGE *)send_buf;
++        char send_attr_buf[256];
++        ALPC_MESSAGE_ATTRIBUTES *send_attr = (ALPC_MESSAGE_ATTRIBUTES *)send_attr_buf;
++        SIZE_T req_attr_size = 0;
++        ALPC_DATA_VIEW_ATTR *view_attr;
++
++        status = pAlpcInitializeMessageAttribute(ALPC_MESSAGE_VIEW_ATTRIBUTE, send_attr, sizeof(send_attr_buf), &req_attr_size);
++        ok(status == STATUS_SUCCESS, "AlpcInitializeMessageAttribute failed: %#lx\n", status);
++        view_attr = pAlpcGetMessageAttribute(send_attr, ALPC_MESSAGE_VIEW_ATTRIBUTE);
++        ok(view_attr != NULL, "Expected valid view attribute pointer\n");
++        view_attr->Flags = 0;
++        view_attr->SectionHandle = section;
++        view_attr->ViewBase = client_view.ViewBase;
++        view_attr->ViewSize = 0x1000;
++        send_attr->ValidAttributes |= ALPC_MESSAGE_VIEW_ATTRIBUTE;
++
++        memset(send_msg, 0, sizeof(*send_msg));
++        send_msg->DataLength = 0;
++        send_msg->TotalLength = sizeof(*send_msg);
++
++        status = pNtAlpcSendWaitReceivePort(client_conn, 0x20000 /* LPC_REQUEST */, send_msg, send_attr, NULL, NULL, NULL, NULL);
++        ok(status == STATUS_SUCCESS, "NtAlpcSendWaitReceivePort (send) failed: %#lx\n", status);
++    }
++
++    /* Server receives message with ALPC_MESSAGE_VIEW_ATTRIBUTE */
++    {
++        char recv_buf[sizeof(ALPC_PORT_MESSAGE) + 32];
++        ALPC_PORT_MESSAGE *recv_msg = (ALPC_PORT_MESSAGE *)recv_buf;
++        char recv_attr_buf[256];
++        ALPC_MESSAGE_ATTRIBUTES *recv_attr = (ALPC_MESSAGE_ATTRIBUTES *)recv_attr_buf;
++        SIZE_T req_attr_size = 0;
++        SIZE_T recv_sz = sizeof(recv_buf);
++        ALPC_DATA_VIEW_ATTR *recvd_view;
++
++        status = pAlpcInitializeMessageAttribute(ALPC_MESSAGE_VIEW_ATTRIBUTE | ALPC_MESSAGE_CONTEXT_ATTRIBUTE,
++                                                 recv_attr, sizeof(recv_attr_buf), &req_attr_size);
++        ok(status == STATUS_SUCCESS, "AlpcInitializeMessageAttribute failed: %#lx\n", status);
++
++        memset(recv_msg, 0, sizeof(*recv_msg));
++        status = pNtAlpcSendWaitReceivePort(server_port, 0, NULL, NULL, recv_msg, &recv_sz, recv_attr, NULL);
++        ok(status == STATUS_SUCCESS, "NtAlpcSendWaitReceivePort (receive) failed: %#lx\n", status);
++
++        ok(recv_attr->ValidAttributes & ALPC_MESSAGE_VIEW_ATTRIBUTE,
++           "Expected ALPC_MESSAGE_VIEW_ATTRIBUTE in ValidAttributes, got %#lx\n", recv_attr->ValidAttributes);
++        recvd_view = pAlpcGetMessageAttribute(recv_attr, ALPC_MESSAGE_VIEW_ATTRIBUTE);
++        ok(recvd_view != NULL, "Expected recvd_view != NULL\n");
++        if (recvd_view)
++        {
++            ok(recvd_view->ViewBase == client_view.ViewBase,
++               "Expected ViewBase %p, got %p\n", client_view.ViewBase, recvd_view->ViewBase);
++            ok(recvd_view->ViewSize == 0x1000,
++               "Expected ViewSize 0x1000, got %Ix\n", recvd_view->ViewSize);
++            ok(!strcmp((char *)recvd_view->ViewBase, "alpc shared payload 12345"),
++               "Received view content mismatch: %s\n", (char *)recvd_view->ViewBase);
++        }
++    }
++
++    /* Clean up */
++    pNtAlpcDeleteSectionView(client_conn, 0, client_view.ViewBase);
++    pNtAlpcDeletePortSection(client_conn, 0, section);
++    if (pNtAlpcDisconnectPort)
++    {
++        pNtAlpcDisconnectPort(client_conn, 0);
++        pNtAlpcDisconnectPort(server_conn, 0);
++    }
++    pNtClose(client_conn);
++    pNtClose(server_conn);
++    pNtClose(server_port);
++}
++
+ START_TEST(alpc)
+ {
+     init_functions();
+@@ -349,4 +542,6 @@ START_TEST(alpc)
+     test_AlpcGetHeaderSize();
+     test_AlpcGetMessageAttribute();
+     test_AlpcInitializeMessageAttribute();
++    test_AlpcSectionView();
++    test_AlpcMessageViewAttribute();
+ }
+diff --git a/dlls/ntdll/unix/alpc.c b/dlls/ntdll/unix/alpc.c
+index ec05b07..8fb7add 100644
+--- a/dlls/ntdll/unix/alpc.c
++++ b/dlls/ntdll/unix/alpc.c
+@@ -37,6 +37,67 @@ WINE_DEFAULT_DEBUG_CHANNEL(alpc);
+ /* ALPC message types (subset of Windows LPC message types) */
+ #define LPC_CONNECTION_REQUEST 10
+ 
++#define ALPC_WIRE_MAGIC 0x434e4e41 /* 'ANNC' */
++struct alpc_wire_hdr
++{
++    unsigned int     magic;
++    unsigned int     type;        /* LPC message type (10 = connection request) */
++    unsigned int     msg_id;
++    unsigned int     client_pid;
++    unsigned int     client_tid;
++    unsigned int     user_size;   /* bytes of user message following */
++    client_ptr_t     port_context;
++    unsigned int     attr_flags;
++    unsigned int     view_flags;
++    client_ptr_t     view_base;
++    client_ptr_t     view_size;
++};
++
++#define ALPC_ATTR_HDR_MAGIC 0x41545452 /* 'ATTR' */
++struct alpc_msg_attr_hdr
++{
++    unsigned int     magic;
++    unsigned int     attr_flags;
++    unsigned int     view_flags;
++    unsigned int     pad;
++    client_ptr_t     view_base;
++    client_ptr_t     view_size;
++};
++
++static void *get_message_attribute( ALPC_MESSAGE_ATTRIBUTES *attributes, ULONG attribute_flag )
++{
++    static const struct
++    {
++        ULONG flag;
++        SIZE_T size;
++    } attribute_sizes[] =
++    {
++        { ALPC_MESSAGE_SECURITY_ATTRIBUTE,       sizeof(ALPC_SECURITY_ATTR) },
++        { ALPC_MESSAGE_VIEW_ATTRIBUTE,           sizeof(ALPC_DATA_VIEW_ATTR) },
++        { ALPC_MESSAGE_CONTEXT_ATTRIBUTE,        sizeof(ALPC_CONTEXT_ATTR) },
++        { ALPC_MESSAGE_HANDLE_ATTRIBUTE,         sizeof(ALPC_HANDLE_ATTR) },
++        { ALPC_MESSAGE_TOKEN_ATTRIBUTE,          sizeof(ALPC_TOKEN_ATTR) },
++        { ALPC_MESSAGE_DIRECT_ATTRIBUTE,         sizeof(ALPC_DIRECT_ATTR) },
++        { ALPC_MESSAGE_WORK_ON_BEHALF_ATTRIBUTE, sizeof(ALPC_WORK_ON_BEHALF_ATTR) },
++    };
++    unsigned int i;
++    SIZE_T off = sizeof(ALPC_MESSAGE_ATTRIBUTES);
++
++    if (!attributes || !attribute_flag || (attribute_flag & (attribute_flag - 1)))
++        return NULL;
++    if ((attributes->AllocatedAttributes & attribute_flag) != attribute_flag)
++        return NULL;
++
++    for (i = 0; i < ARRAY_SIZE(attribute_sizes); i++)
++    {
++        if (attribute_sizes[i].flag == attribute_flag)
++            return (char *)attributes + off;
++        if (attributes->AllocatedAttributes & attribute_sizes[i].flag)
++            off += attribute_sizes[i].size;
++    }
++    return NULL;
++}
++
+ /* Process-global message id counter. Only needs to be unique within a single
+  * server port's pending-connection list, so a global atomic is fine. */
+ static LONG alpc_msg_id_counter;
+@@ -106,6 +167,112 @@ NTSTATUS WINAPI NtAlpcCreatePort( HANDLE *port_handle, OBJECT_ATTRIBUTES *obj_at
+ }
+ 
+ 
++/******************************************************************************
++ *           NtAlpcCreatePortSection  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcCreatePortSection( HANDLE port_handle, ULONG flags,
++                                         HANDLE section_handle, SIZE_T section_size,
++                                         HANDLE *alpc_section_handle, SIZE_T *actual_section_size )
++{
++    NTSTATUS ret;
++    HANDLE sec = NULL;
++
++    TRACE( "(%p, %#x, %p, %Ix, %p, %p)\n",
++           port_handle, (unsigned int)flags, section_handle, section_size,
++           alpc_section_handle, actual_section_size );
++
++    if (!port_handle || !alpc_section_handle)
++        return STATUS_INVALID_PARAMETER;
++
++    if (section_handle)
++    {
++        ret = NtDuplicateObject( NtCurrentProcess(), section_handle,
++                                 NtCurrentProcess(), &sec,
++                                 0, 0, DUPLICATE_SAME_ACCESS );
++        if (ret) return ret;
++    }
++    else
++    {
++        LARGE_INTEGER size;
++        OBJECT_ATTRIBUTES attr;
++
++        if (!section_size) return STATUS_INVALID_PARAMETER;
++        size.QuadPart = section_size;
++        InitializeObjectAttributes( &attr, NULL, 0, NULL, NULL );
++        ret = NtCreateSection( &sec, SECTION_ALL_ACCESS, &attr, &size,
++                               PAGE_READWRITE, SEC_COMMIT, 0 );
++        if (ret) return ret;
++    }
++
++    if (actual_section_size)
++    {
++        SECTION_BASIC_INFORMATION info;
++        if (!NtQuerySection( sec, SectionBasicInformation, &info, sizeof(info), NULL ))
++            *actual_section_size = (SIZE_T)info.Size.QuadPart;
++        else
++            *actual_section_size = section_size;
++    }
++
++    *alpc_section_handle = sec;
++    return STATUS_SUCCESS;
++}
++
++
++/******************************************************************************
++ *           NtAlpcDeletePortSection  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcDeletePortSection( HANDLE port_handle, ULONG flags, HANDLE section_handle )
++{
++    TRACE( "(%p, %#x, %p)\n", port_handle, (unsigned int)flags, section_handle );
++
++    if (!port_handle || !section_handle)
++        return STATUS_INVALID_PARAMETER;
++
++    return NtClose( section_handle );
++}
++
++
++/******************************************************************************
++ *           NtAlpcCreateSectionView  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcCreateSectionView( HANDLE port_handle, ULONG flags,
++                                         ALPC_DATA_VIEW_ATTR *view_attr )
++{
++    NTSTATUS ret;
++    void *base = NULL;
++    SIZE_T size;
++
++    TRACE( "(%p, %#x, %p)\n", port_handle, (unsigned int)flags, view_attr );
++
++    if (!port_handle || !view_attr || !view_attr->SectionHandle)
++        return STATUS_INVALID_PARAMETER;
++
++    base = view_attr->ViewBase;
++    size = view_attr->ViewSize;
++    ret = NtMapViewOfSection( view_attr->SectionHandle, NtCurrentProcess(),
++                              &base, 0, 0, NULL, &size, ViewUnmap, 0, PAGE_READWRITE );
++    if (ret) return ret;
++
++    view_attr->ViewBase = base;
++    view_attr->ViewSize = size;
++    return STATUS_SUCCESS;
++}
++
++
++/******************************************************************************
++ *           NtAlpcDeleteSectionView  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcDeleteSectionView( HANDLE port_handle, ULONG flags, PVOID view_base )
++{
++    TRACE( "(%p, %#x, %p)\n", port_handle, (unsigned int)flags, view_base );
++
++    if (!port_handle || !view_base)
++        return STATUS_INVALID_PARAMETER;
++
++    return NtUnmapViewOfSection( NtCurrentProcess(), view_base );
++}
++
++
+ /******************************************************************************
+  *           NtAlpcConnectPort  (NTDLL.@)
+  */
+@@ -279,6 +446,7 @@ NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, DWORD flags,
+     if (send_msg)
+     {
+         data_size_t send_size = send_msg->TotalLength;
++        struct alpc_msg_attr_hdr attr_hdr;
+ 
+         /* The kernel stamps the message type from the send flags and assigns a
+          * unique non-zero MessageId to a new request (replies echo it back). */
+@@ -287,6 +455,20 @@ NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, DWORD flags,
+         if (!(flags & 0x10000) && !send_msg->MessageId)
+             send_msg->MessageId = next_alpc_msg_id();
+ 
++        memset( &attr_hdr, 0, sizeof(attr_hdr) );
++        attr_hdr.magic = ALPC_ATTR_HDR_MAGIC;
++        if (send_msg_attr && (send_msg_attr->ValidAttributes & ALPC_MESSAGE_VIEW_ATTRIBUTE))
++        {
++            ALPC_DATA_VIEW_ATTR *view = get_message_attribute( send_msg_attr, ALPC_MESSAGE_VIEW_ATTRIBUTE );
++            if (view)
++            {
++                attr_hdr.attr_flags = ALPC_MESSAGE_VIEW_ATTRIBUTE;
++                attr_hdr.view_flags = view->Flags;
++                attr_hdr.view_base  = (client_ptr_t)(ULONG_PTR)view->ViewBase;
++                attr_hdr.view_size  = (client_ptr_t)view->ViewSize;
++            }
++        }
++
+         if (!(async = (struct alpc_async *)alloc_fileio( sizeof(*async), alpc_async_completion, port_handle )))
+             return STATUS_NO_MEMORY;
+         async->buffer = NULL;
+@@ -298,6 +480,7 @@ NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, DWORD flags,
+         {
+             req->async = server_async( port_handle, &async->io, NULL, NULL, NULL, iosb_client_ptr( &io ) );
+             req->pos   = 0;
++            wine_server_add_data( req, &attr_hdr, sizeof(attr_hdr) );
+             wine_server_add_data( req, send_msg, send_size );
+             ret = wine_server_call( req );
+             wait_handle = wine_server_ptr_handle( reply->wait );
+@@ -360,61 +543,68 @@ NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, DWORD flags,
+     if (!ret && recv_buffer_size) *recv_buffer_size = io.Information;
+ 
+     /* Every delivered message is prefixed by a wine-internal wire header
+-     * { u32 magic,type,msg_id,pid,tid,user_size; u64 port_context }. Strip it and
+-     * reconstruct the kernel-filled PORT_MESSAGE fields + CONTEXT attribute. */
+-    if (!ret && recv_msg && io.Information >= 32)
++     * { u32 magic,type,msg_id,pid,tid,user_size; u64 port_context, ... }. Strip it and
++     * reconstruct the kernel-filled PORT_MESSAGE fields + attributes. */
++    if (!ret && recv_msg && io.Information >= sizeof(struct alpc_wire_hdr))
+     {
+-        ULONG  h[6];
+-        ULONGLONG port_context;
+-        memcpy( h, recv_msg, sizeof(h) );
+-        memcpy( &port_context, (char *)recv_msg + 24, sizeof(port_context) );
+-        if (h[0] == 0x434e4e41) /* 'ANNC' */
++        struct alpc_wire_hdr hdr;
++        memcpy( &hdr, recv_msg, sizeof(hdr) );
++        if (hdr.magic == ALPC_WIRE_MAGIC)
+         {
+-            ULONG type = h[1], msg_id = h[2], pid = h[3], tid = h[4], usize = h[5];
+-            char *src = (char *)recv_msg + 32;
++            char *src = (char *)recv_msg + sizeof(struct alpc_wire_hdr);
+             SIZE_T total;
+ 
+-            if (type == LPC_CONNECTION_REQUEST)
++            if (hdr.type == LPC_CONNECTION_REQUEST)
+             {
+                 /* user bytes are the raw connection payload: build a PORT_MESSAGE */
+-                if (usize) memmove( (char *)recv_msg + sizeof(*recv_msg), src, usize );
++                if (hdr.user_size) memmove( (char *)recv_msg + sizeof(*recv_msg), src, hdr.user_size );
+                 memset( recv_msg, 0, sizeof(*recv_msg) );
+-                recv_msg->DataLength  = usize;
+-                recv_msg->TotalLength = sizeof(*recv_msg) + usize;
++                recv_msg->DataLength  = hdr.user_size;
++                recv_msg->TotalLength = sizeof(*recv_msg) + hdr.user_size;
+                 recv_msg->Type        = LPC_CONNECTION_REQUEST;
+-                recv_msg->MessageId   = msg_id;
+-                total = sizeof(*recv_msg) + usize;
++                recv_msg->MessageId   = hdr.msg_id;
++                total = sizeof(*recv_msg) + hdr.user_size;
+             }
+             else
+             {
+                 /* user bytes are the sender's full PORT_MESSAGE: preserve its
+                  * Type/MessageId/CallbackId (reply correlation), only stamp ClientId */
+-                memmove( recv_msg, src, usize );
+-                total = usize;
++                memmove( recv_msg, src, hdr.user_size );
++                total = hdr.user_size;
+             }
+-            recv_msg->ClientId.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+-            recv_msg->ClientId.UniqueThread  = (HANDLE)(ULONG_PTR)tid;
++            recv_msg->ClientId.UniqueProcess = (HANDLE)(ULONG_PTR)hdr.client_pid;
++            recv_msg->ClientId.UniqueThread  = (HANDLE)(ULONG_PTR)hdr.client_tid;
+             if (recv_buffer_size) *recv_buffer_size = total;
+ 
+-            /* deliver the CONTEXT attribute (PortContext) the kernel would fill */
++            /* deliver attributes */
+             if (recv_msg_attr)
+             {
+-                ULONG alloc = recv_msg_attr->AllocatedAttributes;
+-                if (alloc & 0x20000000) /* ALPC_MESSAGE_CONTEXT_ATTRIBUTE */
++                if (recv_msg_attr->AllocatedAttributes & ALPC_MESSAGE_CONTEXT_ATTRIBUTE)
+                 {
+-                    SIZE_T off = 8;
+-                    if (alloc & 0x80000000) off += 24; /* ALPC_SECURITY_ATTR */
+-                    if (alloc & 0x40000000) off += 32; /* ALPC_VIEW_ATTR */
++                    ALPC_CONTEXT_ATTR *ctx = get_message_attribute( recv_msg_attr, ALPC_MESSAGE_CONTEXT_ATTRIBUTE );
++                    if (ctx)
+                     {
+-                        ALPC_CONTEXT_ATTR *ctx =
+-                            (ALPC_CONTEXT_ATTR *)((char *)recv_msg_attr + off);
+-                        ctx->PortContext    = (void *)(ULONG_PTR)port_context;
++                        ctx->PortContext    = (void *)(ULONG_PTR)hdr.port_context;
+                         ctx->MessageContext = NULL;
+                         ctx->Sequence       = 0;
+-                        ctx->MessageId      = msg_id;
++                        ctx->MessageId      = hdr.msg_id;
+                         ctx->CallbackId     = 0;
++                        recv_msg_attr->ValidAttributes |= ALPC_MESSAGE_CONTEXT_ATTRIBUTE;
++                    }
++                }
++
++                if ((hdr.attr_flags & ALPC_MESSAGE_VIEW_ATTRIBUTE) &&
++                    (recv_msg_attr->AllocatedAttributes & ALPC_MESSAGE_VIEW_ATTRIBUTE))
++                {
++                    ALPC_DATA_VIEW_ATTR *view = get_message_attribute( recv_msg_attr, ALPC_MESSAGE_VIEW_ATTRIBUTE );
++                    if (view)
++                    {
++                        view->Flags         = hdr.view_flags;
++                        view->SectionHandle = NULL;
++                        view->ViewBase      = (void *)(ULONG_PTR)hdr.view_base;
++                        view->ViewSize      = (SIZE_T)hdr.view_size;
++                        recv_msg_attr->ValidAttributes |= ALPC_MESSAGE_VIEW_ATTRIBUTE;
+                     }
+-                    recv_msg_attr->ValidAttributes |= 0x20000000;
+                 }
+             }
+         }
+diff --git a/dlls/wow64/struct32.h b/dlls/wow64/struct32.h
+index ba2bc02..29be9d5 100644
+--- a/dlls/wow64/struct32.h
++++ b/dlls/wow64/struct32.h
+@@ -823,6 +823,7 @@ typedef struct
+     ULONG ViewBase;
+     ULONG ViewSize;
+ } ALPC_VIEW_ATTR32, *PALPC_VIEW_ATTR32;
++typedef ALPC_VIEW_ATTR32 ALPC_DATA_VIEW_ATTR32, *PALPC_DATA_VIEW_ATTR32;
+ 
+ typedef struct
+ {
+diff --git a/dlls/wow64/syscall.c b/dlls/wow64/syscall.c
+index d52c52f..f29f0d0 100644
+--- a/dlls/wow64/syscall.c
++++ b/dlls/wow64/syscall.c
+@@ -569,6 +569,84 @@ NTSTATUS WINAPI wow64_NtAlpcCreatePort( UINT *args )
+     return status;
+ }
+ 
++/**********************************************************************
++ *           wow64_NtAlpcCreatePortSection
++ */
++NTSTATUS WINAPI wow64_NtAlpcCreatePortSection( UINT *args )
++{
++    HANDLE port = get_handle( &args );
++    ULONG flags = get_ulong( &args );
++    HANDLE section = get_handle( &args );
++    SIZE_T size = get_ulong( &args );
++    ULONG *alpc_section_ptr = get_ptr( &args );
++    ULONG *actual_size_ptr = get_ptr( &args );
++    HANDLE alpc_section = 0;
++    SIZE_T actual_size = 0;
++    NTSTATUS status;
++
++    status = NtAlpcCreatePortSection( port, flags, section, size,
++                                      alpc_section_ptr ? &alpc_section : NULL,
++                                      actual_size_ptr ? &actual_size : NULL );
++    if (!status)
++    {
++        if (alpc_section_ptr) put_handle( alpc_section_ptr, alpc_section );
++        if (actual_size_ptr) *actual_size_ptr = actual_size;
++    }
++    return status;
++}
++
++/**********************************************************************
++ *           wow64_NtAlpcCreateSectionView
++ */
++NTSTATUS WINAPI wow64_NtAlpcCreateSectionView( UINT *args )
++{
++    HANDLE port = get_handle( &args );
++    ULONG flags = get_ulong( &args );
++    ALPC_DATA_VIEW_ATTR32 *view32 = get_ptr( &args );
++    ALPC_DATA_VIEW_ATTR view;
++    NTSTATUS status;
++
++    if (!view32) return STATUS_INVALID_PARAMETER;
++    view.Flags = view32->Flags;
++    view.SectionHandle = LongToHandle( view32->SectionHandle );
++    view.ViewBase = UlongToPtr( view32->ViewBase );
++    view.ViewSize = view32->ViewSize;
++
++    status = NtAlpcCreateSectionView( port, flags, &view );
++    if (!status)
++    {
++        view32->Flags = view.Flags;
++        view32->SectionHandle = HandleToLong( view.SectionHandle );
++        view32->ViewBase = PtrToUlong( view.ViewBase );
++        view32->ViewSize = view.ViewSize;
++    }
++    return status;
++}
++
++/**********************************************************************
++ *           wow64_NtAlpcDeletePortSection
++ */
++NTSTATUS WINAPI wow64_NtAlpcDeletePortSection( UINT *args )
++{
++    HANDLE port = get_handle( &args );
++    ULONG flags = get_ulong( &args );
++    HANDLE section = get_handle( &args );
++
++    return NtAlpcDeletePortSection( port, flags, section );
++}
++
++/**********************************************************************
++ *           wow64_NtAlpcDeleteSectionView
++ */
++NTSTATUS WINAPI wow64_NtAlpcDeleteSectionView( UINT *args )
++{
++    HANDLE port = get_handle( &args );
++    ULONG flags = get_ulong( &args );
++    void *view_base = get_ptr( &args );
++
++    return NtAlpcDeleteSectionView( port, flags, view_base );
++}
++
+ /**********************************************************************
+  *           wow64_NtAlpcDisconnectPort
+  */
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 1ae0e07..b04a1d8 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6255,6 +6255,17 @@ struct disconnect_alpc_port_reply
+     struct reply_header __header;
+ };
+ 
++#ifndef __ALPC_DATA_VIEW_ATTR_DEFINED__
++#define __ALPC_DATA_VIEW_ATTR_DEFINED__
++typedef struct _ALPC_DATA_VIEW_ATTR
++{
++    ULONG Flags;
++    HANDLE SectionHandle;
++    PVOID ViewBase;
++    SIZE_T ViewSize;
++} ALPC_DATA_VIEW_ATTR, *PALPC_DATA_VIEW_ATTR;
++#endif
++
+ 
+ 
+ struct create_wait_completion_packet_request
+@@ -7313,6 +7324,6 @@ union generic_reply
+     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 947
++#define SERVER_PROTOCOL_VERSION 948
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/include/winternl.h b/include/winternl.h
+index 3077e95..bcb07c3 100644
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -4595,13 +4595,17 @@ typedef struct _ALPC_SECURITY_ATTR
+     HANDLE ContextHandle;
+ } ALPC_SECURITY_ATTR, *PALPC_SECURITY_ATTR;
+ 
+-typedef struct _ALPC_VIEW_ATTR
++#ifndef __ALPC_DATA_VIEW_ATTR_DEFINED__
++#define __ALPC_DATA_VIEW_ATTR_DEFINED__
++typedef struct _ALPC_DATA_VIEW_ATTR
+ {
+     ULONG Flags;
+     HANDLE SectionHandle;
+-    void *ViewBase;
++    PVOID ViewBase;
+     SIZE_T ViewSize;
+-} ALPC_VIEW_ATTR, *PALPC_VIEW_ATTR;
++} ALPC_DATA_VIEW_ATTR, *PALPC_DATA_VIEW_ATTR;
++typedef ALPC_DATA_VIEW_ATTR ALPC_VIEW_ATTR, *PALPC_VIEW_ATTR;
++#endif
+ 
+ typedef struct _ALPC_CONTEXT_ATTR
+ {
+diff --git a/server/alpc.c b/server/alpc.c
+index accc300..e45e803 100644
+--- a/server/alpc.c
++++ b/server/alpc.c
+@@ -65,6 +65,21 @@ struct alpc_wire_hdr
+     unsigned int     client_tid;
+     unsigned int     user_size;   /* bytes of user message following */
+     client_ptr_t     port_context;
++    unsigned int     attr_flags;
++    unsigned int     view_flags;
++    client_ptr_t     view_base;
++    client_ptr_t     view_size;
++};
++
++#define ALPC_ATTR_HDR_MAGIC 0x41545452 /* 'ATTR' */
++struct alpc_msg_attr_hdr
++{
++    unsigned int     magic;
++    unsigned int     attr_flags;
++    unsigned int     view_flags;
++    unsigned int     pad;
++    client_ptr_t     view_base;
++    client_ptr_t     view_size;
+ };
+ 
+ /* A pending (not yet accepted) client connection. */
+@@ -311,15 +326,27 @@ static void alpc_fd_write( struct fd *fd, struct async *async, file_pos_t pos )
+ 
+     {
+         struct alpc_wire_hdr *hdr;
+-        data_size_t blob_size = sizeof(*hdr) + iosb->in_size;
++        struct alpc_msg_attr_hdr attr_hdr;
++        const void *user_data = iosb->in_data;
++        data_size_t user_size = iosb->in_size;
++        data_size_t blob_size;
+         /* context the receiver sees = the per-connection context.
+          * client request: our connection (peer = server side). server reply:
+          * the destination client's connection context. */
+         client_ptr_t ctx;
+-        if (port->is_server)      ctx = peer->port_context;
++        if (port->is_server)        ctx = peer->port_context;
+         else if (port->listen_port) ctx = port->peer->port_context;
+-        else                      ctx = port->port_context;
++        else                        ctx = port->port_context;
++
++        memset( &attr_hdr, 0, sizeof(attr_hdr) );
++        if (user_size >= sizeof(attr_hdr) && *(const unsigned int *)user_data == ALPC_ATTR_HDR_MAGIC)
++        {
++            memcpy( &attr_hdr, user_data, sizeof(attr_hdr) );
++            user_data = (const char *)user_data + sizeof(attr_hdr);
++            user_size -= sizeof(attr_hdr);
++        }
+ 
++        blob_size = sizeof(*hdr) + user_size;
+         if (!(msg = malloc( sizeof(*msg) + blob_size )))
+         {
+             release_object( iosb );
+@@ -336,9 +363,13 @@ static void alpc_fd_write( struct fd *fd, struct async *async, file_pos_t pos )
+         hdr->msg_id       = 0;
+         hdr->client_pid   = get_process_id( current->process );
+         hdr->client_tid   = get_thread_id( current );
+-        hdr->user_size    = iosb->in_size;
++        hdr->user_size    = user_size;
+         hdr->port_context = ctx;
+-        memcpy( hdr + 1, iosb->in_data, iosb->in_size );
++        hdr->attr_flags   = attr_hdr.attr_flags;
++        hdr->view_flags   = attr_hdr.view_flags;
++        hdr->view_base    = attr_hdr.view_base;
++        hdr->view_size    = attr_hdr.view_size;
++        if (user_size) memcpy( hdr + 1, user_data, user_size );
+     }
+ 
+     list_add_tail( &peer->msg_queue, &msg->entry );
+@@ -401,6 +432,10 @@ static int queue_connect_notification( struct alpc_port *server_port, struct alp
+     hdr->client_tid   = pc->client_tid;
+     hdr->user_size    = pc->conn_data_size;
+     hdr->port_context = 0;
++    hdr->attr_flags   = 0;
++    hdr->view_flags   = 0;
++    hdr->view_base    = 0;
++    hdr->view_size    = 0;
+     if (pc->conn_data_size)
+         memcpy( hdr + 1, pc->conn_data, pc->conn_data_size );
+ 
+diff --git a/server/protocol.def b/server/protocol.def
+index fe7628f..db61c7b 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4335,6 +4335,17 @@ enum inproc_sync_type
+     obj_handle_t        handle;         /* ALPC port or connection handle */
+ @END
+ 
++#ifndef __ALPC_DATA_VIEW_ATTR_DEFINED__
++#define __ALPC_DATA_VIEW_ATTR_DEFINED__
++typedef struct _ALPC_DATA_VIEW_ATTR
++{
++    ULONG Flags;
++    HANDLE SectionHandle;
++    PVOID ViewBase;
++    SIZE_T ViewSize;
++} ALPC_DATA_VIEW_ATTR, *PALPC_DATA_VIEW_ATTR;
++#endif
++
+ 
+ /* Create a wait completion packet */
+ @REQ(create_wait_completion_packet)
+-- 
+2.56.0
+

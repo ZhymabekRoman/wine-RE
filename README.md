@@ -28,7 +28,7 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
 * **Path**: `patches/ntdll-WaitCompletionPacket/`
 * **Target Subsystem**: NTDLL & Wineserver Async Wait Completion Engine & ALPC Message Bus
 * **Depends on**: `ntdll-NtAlpcCreatePort`
-* **Patches (0001–0007)**:
+* **Patches (0001–0008)**:
   * `0001`: Implements `NtCreateWaitCompletionPacket`, `NtAssociateWaitCompletionPacket`, and `NtCancelWaitCompletionPacket` + wineserver completion packet object.
   * `0002`: Emulates Windows kernel ALPC connection handshake behavior expected by `CoreMessagingXP.dll`, status `0x87b2080c`, and flag byte checks at offset `+0x3a`.
   * `0003`: Transports ALPC connection-message payload and `ClientId`.
@@ -36,6 +36,7 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
   * `0005`: ALPC post-accept message routing + per-client `PortContext` and `ClientId` delivery.
   * `0006`: Stamps ALPC message `Type` and assigns `MessageId`; fixes send use-after-free.
   * `0007`: Corrects per-message `PortContext` for reply direction.
+  * `0008`: Implements ALPC Section Views (`NtAlpcCreatePortSection`, `NtAlpcCreateSectionView`, `NtAlpcDeletePortSection`, `NtAlpcDeleteSectionView`) and `ALPC_MESSAGE_VIEW_ATTRIBUTE` (0x40000000) wire propagation for shared memory transport.
 
 ### 3. `kernelbase-PackageIdentity`
 * **Path**: `patches/kernelbase-PackageIdentity/`
