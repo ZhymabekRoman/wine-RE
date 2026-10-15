@@ -1,0 +1,50 @@
+From e4b6320e8e77360f729773dc8dbe5661891d1e18 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Sun, 14 Jun 2026 14:00:32 +0500
+Subject: [PATCH 3/3] kernelbase: AppPolicyGetWindowingModel returns Universal
+ for packaged apps
+
+A packaged WinUI3 app must get AppPolicyWindowingModel_Universal, not
+ClassicDesktop. Returning ClassicDesktop sent XAML down the wrong windowing
+init path, producing an empty CoreUI dispatch registration -> arg7=0 ->
+CoreUICallReceive AV. Detect package context (WINE_PACKAGE_FULL_NAME) and
+return Universal. This eliminates the CoreMessaging AV; WhatsApp now reaches
+Application.Start and fails later with a clean E_NOTIMPL HRESULT instead.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ dlls/kernelbase/main.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/kernelbase/main.c b/dlls/kernelbase/main.c
+index 456bcf5..06e1053 100644
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -139,13 +139,23 @@ LONG WINAPI AppPolicyGetShowDeveloperDiagnostic(HANDLE token, AppPolicyShowDevel
+ LONG WINAPI AppPolicyGetWindowingModel(HANDLE token, AppPolicyWindowingModel *policy)
+ {
+     static int once;
++    const WCHAR *pkg = NULL;
++    WCHAR buf[8];
+ 
+     if(!once++)
+         FIXME("%p, %p\n", token, policy);
+ 
+-    if(policy)
++    if(!policy)
++        return ERROR_INVALID_PARAMETER;
++
++    /* A packaged app gets the Universal windowing model; classic desktop only
++     * for non-packaged processes. Detect package context via the env marker. */
++    if (GetEnvironmentVariableW( L"WINE_PACKAGE_FULL_NAME", buf, ARRAY_SIZE(buf) ))
++        *policy = AppPolicyWindowingModel_Universal;
++    else
+         *policy = AppPolicyWindowingModel_ClassicDesktop;
+ 
++    (void)pkg;
+     return ERROR_SUCCESS;
+ }
+ 
+-- 
+2.56.0
+

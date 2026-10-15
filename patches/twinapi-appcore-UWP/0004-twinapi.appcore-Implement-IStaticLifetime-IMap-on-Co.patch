@@ -1,0 +1,432 @@
+From 99e0c526ad92e09f0e6f1e7d125df08656b69b4c Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Sun, 14 Jun 2026 15:52:45 +0500
+Subject: [PATCH 4/9] twinapi.appcore: Implement IStaticLifetime + IMap on
+ CoreApplication factory
+
+FrameworkUdk (C++/WinRT static_lifetime) calls RoGetActivationFactory for
+IID 17b0e613 (IStaticLifetime) on CoreApplication and fail-fasts on E_NOINTERFACE.
+Add IStaticLifetime (GetCollection -> process-wide IMap<HSTRING,IInspectable>) +
+a minimal thread-safe IMap impl (static_lifetime_map.c). QI now succeeds; the
+fail-fast HRESULT changed (0x80004002 -> 0xffffffff), failure moved deeper into
+FrameworkUdk's post-get_IsMain view handling.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ dlls/twinapi.appcore/Makefile.in           |   1 +
+ dlls/twinapi.appcore/core_application.c    |  96 ++++++++
+ dlls/twinapi.appcore/private.h             |   2 +
+ dlls/twinapi.appcore/static_lifetime_map.c | 251 +++++++++++++++++++++
+ 4 files changed, 350 insertions(+)
+ create mode 100644 dlls/twinapi.appcore/static_lifetime_map.c
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 9e42248..865ecb6 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -9,5 +9,6 @@ SOURCES = \
+ 	classes.idl \
+ 	client_device_information.c \
+ 	core_application.c \
++	static_lifetime_map.c \
+ 	data_transfer.c \
+ 	main.c
+diff --git a/dlls/twinapi.appcore/core_application.c b/dlls/twinapi.appcore/core_application.c
+index 7c3dfab..47a259c 100644
+--- a/dlls/twinapi.appcore/core_application.c
++++ b/dlls/twinapi.appcore/core_application.c
+@@ -24,10 +24,31 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+ 
++/* C++/WinRT static-lifetime helper: get_activation_factory<IStaticLifetime>(class)
++ * then GetCollection() returns a process-wide IMap<HSTRING,IInspectable> used to
++ * cache static instances tied to the CoreApplication lifetime. WhatsApp/FrameworkUdk
++ * hard-requires this on the CoreApplication factory; without it XAML fail-fasts. */
++static const GUID IID_IStaticLifetime = {0x17b0e613,0x942a,0x422d,{0x90,0x4c,0xf9,0x0d,0xc7,0x1a,0x7d,0xae}};
++
++typedef struct IStaticLifetime IStaticLifetime;
++typedef struct IStaticLifetimeVtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)( IStaticLifetime *, REFIID, void ** );
++    ULONG   (STDMETHODCALLTYPE *AddRef)( IStaticLifetime * );
++    ULONG   (STDMETHODCALLTYPE *Release)( IStaticLifetime * );
++    HRESULT (STDMETHODCALLTYPE *GetIids)( IStaticLifetime *, ULONG *, IID ** );
++    HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)( IStaticLifetime *, HSTRING * );
++    HRESULT (STDMETHODCALLTYPE *GetTrustLevel)( IStaticLifetime *, TrustLevel * );
++    HRESULT (STDMETHODCALLTYPE *GetCollection)( IStaticLifetime *, __FIMap_2_HSTRING_IInspectable ** );
++} IStaticLifetimeVtbl;
++struct IStaticLifetime { const IStaticLifetimeVtbl *lpVtbl; };
++
+ struct factory
+ {
+     IActivationFactory IActivationFactory_iface;
+     ICoreApplication ICoreApplication_iface;
++    IStaticLifetime IStaticLifetime_iface;
++    __FIMap_2_HSTRING_IInspectable *static_map;
+     LONG ref;
+ };
+ 
+@@ -64,6 +85,13 @@ static HRESULT WINAPI activation_factory_QueryInterface( IActivationFactory *ifa
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID( iid, &IID_IStaticLifetime ))
++    {
++        IActivationFactory_AddRef( &impl->IActivationFactory_iface );
++        *out = &impl->IStaticLifetime_iface;
++        return S_OK;
++    }
++
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -411,10 +439,78 @@ static const struct ICoreApplicationVtbl core_application_vtbl =
+     core_application_RunWithActivationFactories,
+ };
+ 
++/* ---- IStaticLifetime: GetCollection returns a process-wide IMap<HSTRING,IInspectable> ---- */
++
++static inline struct factory *impl_from_IStaticLifetime( IStaticLifetime *iface )
++{
++    return CONTAINING_RECORD( iface, struct factory, IStaticLifetime_iface );
++}
++
++static HRESULT STDMETHODCALLTYPE static_lifetime_QueryInterface( IStaticLifetime *iface, REFIID iid, void **out )
++{
++    struct factory *impl = impl_from_IStaticLifetime( iface );
++    return IActivationFactory_QueryInterface( &impl->IActivationFactory_iface, iid, out );
++}
++static ULONG STDMETHODCALLTYPE static_lifetime_AddRef( IStaticLifetime *iface )
++{
++    struct factory *impl = impl_from_IStaticLifetime( iface );
++    return IActivationFactory_AddRef( &impl->IActivationFactory_iface );
++}
++static ULONG STDMETHODCALLTYPE static_lifetime_Release( IStaticLifetime *iface )
++{
++    struct factory *impl = impl_from_IStaticLifetime( iface );
++    return IActivationFactory_Release( &impl->IActivationFactory_iface );
++}
++static HRESULT STDMETHODCALLTYPE static_lifetime_GetIids( IStaticLifetime *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT STDMETHODCALLTYPE static_lifetime_GetRuntimeClassName( IStaticLifetime *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT STDMETHODCALLTYPE static_lifetime_GetTrustLevel( IStaticLifetime *iface, TrustLevel *level )
++{
++    if (level) *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT STDMETHODCALLTYPE static_lifetime_GetCollection( IStaticLifetime *iface,
++        __FIMap_2_HSTRING_IInspectable **value )
++{
++    struct factory *impl = impl_from_IStaticLifetime( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++
++    if (!impl->static_map)
++    {
++        HRESULT hr = static_lifetime_map_create( &impl->static_map );
++        if (FAILED(hr)) { *value = NULL; return hr; }
++    }
++    __FIMap_2_HSTRING_IInspectable_AddRef( impl->static_map );
++    *value = impl->static_map;
++    return S_OK;
++}
++
++static const IStaticLifetimeVtbl static_lifetime_vtbl =
++{
++    static_lifetime_QueryInterface,
++    static_lifetime_AddRef,
++    static_lifetime_Release,
++    static_lifetime_GetIids,
++    static_lifetime_GetRuntimeClassName,
++    static_lifetime_GetTrustLevel,
++    static_lifetime_GetCollection,
++};
++
+ static struct factory factory =
+ {
+     {&activation_factory_vtbl},
+     {&core_application_vtbl},
++    {&static_lifetime_vtbl},
++    NULL,
+     1,
+ };
+ 
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index bcc1593..69f14ff 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -90,3 +90,5 @@ extern IActivationFactory *data_transfer_manager_statics_factory;
+     }
+ #define DEFINE_IINSPECTABLE( pfx, iface_type, impl_type, base_iface )                              \
+     DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from_##iface_type, iface_type##_iface, &impl->base_iface )
++
++extern HRESULT static_lifetime_map_create( __FIMap_2_HSTRING_IInspectable **out );
+diff --git a/dlls/twinapi.appcore/static_lifetime_map.c b/dlls/twinapi.appcore/static_lifetime_map.c
+new file mode 100644
+index 0000000..cc7b3f7
+--- /dev/null
++++ b/dlls/twinapi.appcore/static_lifetime_map.c
+@@ -0,0 +1,251 @@
++/* Minimal IMap<HSTRING, IInspectable> for CoreApplication's IStaticLifetime.
++ *
++ * Copyright 2026 for CodeWeavers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++struct map_entry
++{
++    HSTRING key;
++    IInspectable *value;
++};
++
++struct static_map
++{
++    __FIMap_2_HSTRING_IInspectable IMap_iface;
++    LONG ref;
++    struct map_entry *entries;
++    SIZE_T count, capacity;
++    CRITICAL_SECTION cs;
++};
++
++static inline struct static_map *impl_from_IMap( __FIMap_2_HSTRING_IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct static_map, IMap_iface );
++}
++
++static int key_equal( HSTRING a, HSTRING b )
++{
++    INT32 r = 0;
++    WindowsCompareStringOrdinal( a, b, &r );
++    return r == 0;
++}
++
++static struct map_entry *find_entry( struct static_map *impl, HSTRING key )
++{
++    SIZE_T i;
++    for (i = 0; i < impl->count; i++)
++        if (key_equal( impl->entries[i].key, key )) return &impl->entries[i];
++    return NULL;
++}
++
++static HRESULT WINAPI map_QueryInterface( __FIMap_2_HSTRING_IInspectable *iface, REFIID iid, void **out )
++{
++    struct static_map *impl = impl_from_IMap( iface );
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID___FIMap_2_HSTRING_IInspectable ))
++    {
++        __FIMap_2_HSTRING_IInspectable_AddRef( &impl->IMap_iface );
++        *out = &impl->IMap_iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI map_AddRef( __FIMap_2_HSTRING_IInspectable *iface )
++{
++    return InterlockedIncrement( &impl_from_IMap( iface )->ref );
++}
++
++static ULONG WINAPI map_Release( __FIMap_2_HSTRING_IInspectable *iface )
++{
++    struct static_map *impl = impl_from_IMap( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        SIZE_T i;
++        for (i = 0; i < impl->count; i++)
++        {
++            WindowsDeleteString( impl->entries[i].key );
++            if (impl->entries[i].value) IInspectable_Release( impl->entries[i].value );
++        }
++        free( impl->entries );
++        impl->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &impl->cs );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI map_GetIids( __FIMap_2_HSTRING_IInspectable *iface, ULONG *count, IID **iids )
++{ *count = 0; *iids = NULL; return S_OK; }
++static HRESULT WINAPI map_GetRuntimeClassName( __FIMap_2_HSTRING_IInspectable *iface, HSTRING *name )
++{ return E_NOTIMPL; }
++static HRESULT WINAPI map_GetTrustLevel( __FIMap_2_HSTRING_IInspectable *iface, TrustLevel *level )
++{ if (level) *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI map_Lookup( __FIMap_2_HSTRING_IInspectable *iface, HSTRING key, IInspectable **value )
++{
++    struct static_map *impl = impl_from_IMap( iface );
++    struct map_entry *e;
++    HRESULT hr = E_BOUNDS;
++
++    TRACE( "iface %p, key %s, value %p.\n", iface, debugstr_hstring( key ), value );
++    if (!value) return E_POINTER;
++    EnterCriticalSection( &impl->cs );
++    if ((e = find_entry( impl, key )))
++    {
++        if (e->value) IInspectable_AddRef( e->value );
++        *value = e->value;
++        hr = S_OK;
++    }
++    else *value = NULL;
++    LeaveCriticalSection( &impl->cs );
++    return hr;
++}
++
++static HRESULT WINAPI map_get_Size( __FIMap_2_HSTRING_IInspectable *iface, UINT32 *size )
++{
++    struct static_map *impl = impl_from_IMap( iface );
++    if (size) *size = impl->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI map_HasKey( __FIMap_2_HSTRING_IInspectable *iface, HSTRING key, boolean *found )
++{
++    struct static_map *impl = impl_from_IMap( iface );
++    TRACE( "iface %p, key %s.\n", iface, debugstr_hstring( key ) );
++    if (!found) return E_POINTER;
++    EnterCriticalSection( &impl->cs );
++    *found = find_entry( impl, key ) != NULL;
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI map_GetView( __FIMap_2_HSTRING_IInspectable *iface,
++        __FIMapView_2_HSTRING_IInspectable **view )
++{
++    FIXME( "iface %p, view %p stub!\n", iface, view );
++    if (view) *view = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI map_Insert( __FIMap_2_HSTRING_IInspectable *iface, HSTRING key,
++        IInspectable *value, boolean *replaced )
++{
++    struct static_map *impl = impl_from_IMap( iface );
++    struct map_entry *e;
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p, key %s, value %p.\n", iface, debugstr_hstring( key ), value );
++    EnterCriticalSection( &impl->cs );
++    if ((e = find_entry( impl, key )))
++    {
++        if (e->value) IInspectable_Release( e->value );
++        if ((e->value = value)) IInspectable_AddRef( value );
++        if (replaced) *replaced = TRUE;
++    }
++    else
++    {
++        if (impl->count >= impl->capacity)
++        {
++            SIZE_T cap = impl->capacity ? impl->capacity * 2 : 8;
++            struct map_entry *tmp = realloc( impl->entries, cap * sizeof(*tmp) );
++            if (!tmp) { hr = E_OUTOFMEMORY; goto done; }
++            impl->entries = tmp;
++            impl->capacity = cap;
++        }
++        if (FAILED(hr = WindowsDuplicateString( key, &impl->entries[impl->count].key ))) goto done;
++        if ((impl->entries[impl->count].value = value)) IInspectable_AddRef( value );
++        impl->count++;
++        if (replaced) *replaced = FALSE;
++    }
++done:
++    LeaveCriticalSection( &impl->cs );
++    return hr;
++}
++
++static HRESULT WINAPI map_Remove( __FIMap_2_HSTRING_IInspectable *iface, HSTRING key )
++{
++    struct static_map *impl = impl_from_IMap( iface );
++    struct map_entry *e;
++    HRESULT hr = E_BOUNDS;
++
++    EnterCriticalSection( &impl->cs );
++    if ((e = find_entry( impl, key )))
++    {
++        SIZE_T idx = e - impl->entries;
++        WindowsDeleteString( e->key );
++        if (e->value) IInspectable_Release( e->value );
++        memmove( &impl->entries[idx], &impl->entries[idx + 1],
++                 (impl->count - idx - 1) * sizeof(*e) );
++        impl->count--;
++        hr = S_OK;
++    }
++    LeaveCriticalSection( &impl->cs );
++    return hr;
++}
++
++static HRESULT WINAPI map_Clear( __FIMap_2_HSTRING_IInspectable *iface )
++{
++    struct static_map *impl = impl_from_IMap( iface );
++    SIZE_T i;
++    EnterCriticalSection( &impl->cs );
++    for (i = 0; i < impl->count; i++)
++    {
++        WindowsDeleteString( impl->entries[i].key );
++        if (impl->entries[i].value) IInspectable_Release( impl->entries[i].value );
++    }
++    impl->count = 0;
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static const struct __FIMap_2_HSTRING_IInspectableVtbl static_map_vtbl =
++{
++    map_QueryInterface,
++    map_AddRef,
++    map_Release,
++    map_GetIids,
++    map_GetRuntimeClassName,
++    map_GetTrustLevel,
++    map_Lookup,
++    map_get_Size,
++    map_HasKey,
++    map_GetView,
++    map_Insert,
++    map_Remove,
++    map_Clear,
++};
++
++HRESULT static_lifetime_map_create( __FIMap_2_HSTRING_IInspectable **out )
++{
++    struct static_map *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IMap_iface.lpVtbl = &static_map_vtbl;
++    impl->ref = 1;
++    InitializeCriticalSectionEx( &impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)( __FILE__ ": static_map.cs" );
++    *out = &impl->IMap_iface;
++    return S_OK;
++}
+-- 
+2.56.0
+

@@ -1,0 +1,61 @@
+From 205262c0446581bd28715d2ee1dec46c9a4e8772 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Sat, 13 Jun 2026 22:06:40 +0500
+Subject: [PATCH 4/5] ntdll: Stamp ALPC message Type + assign MessageId; fix
+ send use-after-free
+
+- Stamp PORT_MESSAGE.Type from the send flags (LPC_REQUEST=1 for
+  ALPC_MSGFLG_SYNC_REQUEST, LPC_REPLY=2 for ALPC_MSGFLG_REPLY_MESSAGE) so the
+  receiver's CoreMessaging dispatcher routes the message correctly.
+- Assign a unique non-zero MessageId to each new request (replies echo it back
+  for correlation); the kernel does this on Windows.
+- Fix use-after-free in the send path: when the write completes inline
+  (non-pending), free the async before wait_async() would dereference it through
+  the completion APC. Only wait_async on the pending path.
+
+With these, the full CoreMessaging connect->impersonate->accept->request->reply
+exchange completes; WhatsApp progresses past CoreMessaging ALPC into WinUI3
+XAML Application.Start.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/alpc.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/alpc.c b/dlls/ntdll/unix/alpc.c
+index 40cdfe0..ec05b07 100644
+--- a/dlls/ntdll/unix/alpc.c
++++ b/dlls/ntdll/unix/alpc.c
+@@ -280,6 +280,13 @@ NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, DWORD flags,
+     {
+         data_size_t send_size = send_msg->TotalLength;
+ 
++        /* The kernel stamps the message type from the send flags and assigns a
++         * unique non-zero MessageId to a new request (replies echo it back). */
++        if (flags & 0x10000)        send_msg->Type = 2; /* LPC_REPLY */
++        else if (flags & 0x20000)   send_msg->Type = 1; /* LPC_REQUEST */
++        if (!(flags & 0x10000) && !send_msg->MessageId)
++            send_msg->MessageId = next_alpc_msg_id();
++
+         if (!(async = (struct alpc_async *)alloc_fileio( sizeof(*async), alpc_async_completion, port_handle )))
+             return STATUS_NO_MEMORY;
+         async->buffer = NULL;
+@@ -297,8 +304,13 @@ NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, DWORD flags,
+         }
+         SERVER_END_REQ;
+ 
+-        if (ret != STATUS_PENDING) free( async );
+-        if (wait_handle) ret = wait_async( wait_handle, FALSE );
++        if (ret == STATUS_PENDING)
++            ret = wait_async( wait_handle, FALSE );  /* frees async via the completion apc */
++        else
++        {
++            free( async );
++            if (wait_handle) NtClose( wait_handle );
++        }
+ 
+         if (ret) return ret;
+     }
+-- 
+2.56.0
+

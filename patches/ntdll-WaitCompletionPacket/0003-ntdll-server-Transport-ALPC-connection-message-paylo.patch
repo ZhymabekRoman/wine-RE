@@ -1,0 +1,301 @@
+From e8a2bd8a08802212831efad49388c18507e1e28f Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Sat, 13 Jun 2026 20:05:39 +0500
+Subject: [PATCH 1/5] ntdll/server: Transport ALPC connection-message payload +
+ ClientId
+
+CoreMessaging validates the connection request's DataLength (requires 0x18
+bytes) and payload content before accepting. Wine now forwards the client's
+NtAlpcConnectPort connection-message payload through the connect_alpc_port
+request to the server, and fills the received PORT_MESSAGE ClientId with the
+connecting process/thread id. With this CoreMessaging passes the DataLength
+check and builds its per-connection channel object (PortContext now non-NULL).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/alpc.c         | 29 +++++++----
+ include/wine/server_protocol.h |  3 +-
+ server/alpc.c                  | 91 +++++++++++++++++++++++-----------
+ server/protocol.def            |  1 +
+ server/request_trace.h         |  1 +
+ 5 files changed, 86 insertions(+), 39 deletions(-)
+
+diff --git a/dlls/ntdll/unix/alpc.c b/dlls/ntdll/unix/alpc.c
+index 1e03ef5..f0d8d0d 100644
+--- a/dlls/ntdll/unix/alpc.c
++++ b/dlls/ntdll/unix/alpc.c
+@@ -155,6 +155,10 @@ NTSTATUS WINAPI NtAlpcConnectPort( HANDLE *port_handle, UNICODE_STRING *port_nam
+         req->async   = server_async( NULL, &async->io, NULL, NULL, NULL, iosb_client_ptr( &io ) );
+         req->msg_id  = msg_id;
+         wine_server_add_data( req, objattr, len );
++        /* forward the caller's connection-message payload so the server can
++         * validate it before accepting */
++        if (connect_msg && connect_msg->DataLength)
++            wine_server_add_data( req, connect_msg + 1, connect_msg->DataLength );
+         ret = wine_server_call( req );
+         if (!ret || ret == STATUS_PENDING)
+         {
+@@ -342,20 +346,27 @@ NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, DWORD flags,
+ 
+     if (!ret && recv_buffer_size) *recv_buffer_size = io.Information;
+ 
+-    /* Detect the wine-internal connect notification blob and turn it into a
+-     * proper PORT_MESSAGE in-place. */
+-    if (!ret && recv_msg && io.Information == 2 * sizeof(ULONG))
++    /* Detect the wine-internal connect-notification blob
++     * { magic, msg_id, client_pid, client_tid, payload_size, payload... }
++     * and turn it into a proper LPC_CONNECTION_REQUEST PORT_MESSAGE in-place. */
++    if (!ret && recv_msg && io.Information >= 5 * sizeof(ULONG))
+     {
+-        ULONG hdr[2];
++        ULONG hdr[5];
+         memcpy( hdr, recv_msg, sizeof(hdr) );
+-        if (hdr[0] == 1) /* is_connect flag */
++        if (hdr[0] == 0x434e4e41) /* 'ANNC' */
+         {
++            ULONG msg_id = hdr[1], pid = hdr[2], tid = hdr[3], payload = hdr[4];
++            char *src = (char *)recv_msg + 5 * sizeof(ULONG);
++
++            if (payload) memmove( (char *)recv_msg + sizeof(*recv_msg), src, payload );
+             memset( recv_msg, 0, sizeof(*recv_msg) );
+-            recv_msg->TotalLength = sizeof(*recv_msg);
+-            recv_msg->DataLength  = 0;
++            recv_msg->DataLength  = payload;
++            recv_msg->TotalLength = sizeof(*recv_msg) + payload;
+             recv_msg->Type        = LPC_CONNECTION_REQUEST;
+-            recv_msg->MessageId   = hdr[1];
+-            if (recv_buffer_size) *recv_buffer_size = sizeof(*recv_msg);
++            recv_msg->MessageId   = msg_id;
++            recv_msg->ClientId.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
++            recv_msg->ClientId.UniqueThread  = (HANDLE)(ULONG_PTR)tid;
++            if (recv_buffer_size) *recv_buffer_size = sizeof(*recv_msg) + payload;
+         }
+     }
+ 
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index a327263..e0e1b2c 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6218,6 +6218,7 @@ struct connect_alpc_port_request
+     struct async_data   async;
+     unsigned int        msg_id;
+     /* VARARG(objattr,object_attributes); */
++    /* VARARG(connect_data,bytes); */
+     char __pad_60[4];
+ };
+ struct connect_alpc_port_reply
+@@ -7262,6 +7263,6 @@ union generic_reply
+     struct cancel_wait_completion_packet_reply cancel_wait_completion_packet_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 944
++#define SERVER_PROTOCOL_VERSION 945
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/alpc.c b/server/alpc.c
+index d89500e..2a35e76 100644
+--- a/server/alpc.c
++++ b/server/alpc.c
+@@ -50,6 +50,19 @@ struct alpc_message
+     /* user data bytes follow */
+ };
+ 
++/* wine-internal connect-notification blob delivered on the listening port:
++ * { magic, msg_id, client_pid, client_tid, payload_size, payload... } */
++#define ALPC_CONNECT_MAGIC 0x434e4e41 /* 'ANNC' */
++struct alpc_connect_blob
++{
++    unsigned int magic;
++    unsigned int msg_id;
++    unsigned int client_pid;
++    unsigned int client_tid;
++    unsigned int payload_size;
++    /* payload bytes follow */
++};
++
+ /* A pending (not yet accepted) client connection. */
+ struct alpc_pending_conn
+ {
+@@ -57,6 +70,10 @@ struct alpc_pending_conn
+     unsigned int     msg_id;         /* same as the connect message id */
+     struct alpc_port *client_port;   /* client-side connection port object */
+     struct async     *client_async;  /* async blocking NtAlpcConnectPort */
++    char            *conn_data;      /* client's connection message payload */
++    data_size_t      conn_data_size;
++    unsigned int     client_pid;
++    unsigned int     client_tid;
+ };
+ 
+ struct alpc_port;
+@@ -181,8 +198,7 @@ static void alpc_port_destroy( struct object *obj )
+                 async_terminate( pc->client_async, STATUS_OBJECT_NAME_NOT_FOUND );
+                 release_object( pc->client_async );
+             }
+-            if (pc->client_port) release_object( pc->client_port );
+-            free( pc );
++            if (pc->client_port) release_object( pc->client_port );            free( pc->conn_data );            free( pc );
+         }
+     }
+     else if (port->peer)
+@@ -310,27 +326,29 @@ static struct alpc_port *create_alpc_port_obj( int is_server )
+ }
+ 
+ /* Queue a connect-notification message to the server port's msg_queue. */
+-static int queue_connect_notification( struct alpc_port *server_port, unsigned int msg_id )
++static int queue_connect_notification( struct alpc_port *server_port, struct alpc_pending_conn *pc )
+ {
+     struct alpc_message *msg;
++    struct alpc_connect_blob *blob;
++    data_size_t blob_size = sizeof(*blob) + pc->conn_data_size;
+ 
+-    /* The payload is { unsigned int is_connect=1, unsigned int msg_id }
+-     * so ntdll can reliably detect this as a connect notification. */
++    if (!(msg = malloc( sizeof(*msg) + blob_size )))
+     {
+-        unsigned int hdr[2];
+-        msg = malloc( sizeof(*msg) + sizeof(hdr) );
+-        if (!msg)
+-        {
+-            set_error( STATUS_NO_MEMORY );
+-            return 0;
+-        }
+-        hdr[0] = 1; /* is_connect flag */
+-        hdr[1] = msg_id;
+-        msg->is_connect = 1;
+-        msg->msg_id     = msg_id;
+-        msg->data_size  = sizeof(hdr);
+-        memcpy( (char *)msg + sizeof(*msg), hdr, sizeof(hdr) );
++        set_error( STATUS_NO_MEMORY );
++        return 0;
+     }
++    msg->is_connect = 1;
++    msg->msg_id     = pc->msg_id;
++    msg->data_size  = blob_size;
++
++    blob = (struct alpc_connect_blob *)((char *)msg + sizeof(*msg));
++    blob->magic        = ALPC_CONNECT_MAGIC;
++    blob->msg_id       = pc->msg_id;
++    blob->client_pid   = pc->client_pid;
++    blob->client_tid   = pc->client_tid;
++    blob->payload_size = pc->conn_data_size;
++    if (pc->conn_data_size)
++        memcpy( blob + 1, pc->conn_data, pc->conn_data_size );
+ 
+     list_add_tail( &server_port->msg_queue, &msg->entry );
+     wake_up( &server_port->obj, 0 );
+@@ -422,12 +440,32 @@ DECL_HANDLER(connect_alpc_port)
+     pc->msg_id       = req->msg_id;
+     pc->client_port  = (struct alpc_port *)grab_object( client_port );
+     pc->client_async = NULL;
++    pc->conn_data    = NULL;
++    pc->conn_data_size = 0;
++    pc->client_pid   = get_process_id( current->process );
++    pc->client_tid   = get_thread_id( current );
++
++    /* Capture the client's connection-message payload (follows the object
++     * attributes), which the server validates before accepting. */
++    {
++        data_size_t cdata_size;
++        const void *cdata = get_req_data_after_objattr( objattr, &cdata_size );
++        if (cdata && cdata_size)
++        {
++            if ((pc->conn_data = malloc( cdata_size )))
++            {
++                memcpy( pc->conn_data, cdata, cdata_size );
++                pc->conn_data_size = cdata_size;
++            }
++        }
++    }
+ 
+     /* Create handle for client now; peer will be wired up after accept */
+     reply->handle = alloc_handle( current->process, client_port, GENERIC_ALL, 0 );
+     if (!reply->handle)
+     {
+         release_object( client_port );
++        free( pc->conn_data );
+         free( pc );
+         release_object( server_port );
+         return;
+@@ -435,13 +473,12 @@ DECL_HANDLER(connect_alpc_port)
+ 
+     /* Queue connect notification to server port */
+     list_add_tail( &server_port->pending_conns, &pc->entry );
+-    if (!queue_connect_notification( server_port, req->msg_id ))
++    if (!queue_connect_notification( server_port, pc ))
+     {
+         list_remove( &pc->entry );
+         close_handle( current->process, reply->handle );
+         reply->handle = 0;
+-        release_object( client_port );
+-        free( pc );
++        release_object( client_port );        free( pc->conn_data );        free( pc );
+         release_object( server_port );
+         return;
+     }
+@@ -480,8 +517,7 @@ DECL_HANDLER(connect_alpc_port)
+             }
+             close_handle( current->process, reply->handle );
+             reply->handle = 0;
+-            release_object( client_port );
+-            free( pc );
++            release_object( client_port );            free( pc->conn_data );            free( pc );
+         }
+     }
+ 
+@@ -534,8 +570,7 @@ DECL_HANDLER(accept_alpc_connection)
+             async_terminate( found->client_async, STATUS_CONNECTION_REFUSED );
+             release_object( found->client_async );
+         }
+-        release_object( found->client_port );
+-        free( found );
++        release_object( found->client_port );        free( found->conn_data );        free( found );
+         release_object( server_port );
+         return;
+     }
+@@ -548,8 +583,7 @@ DECL_HANDLER(accept_alpc_connection)
+             async_terminate( found->client_async, STATUS_NO_MEMORY );
+             release_object( found->client_async );
+         }
+-        release_object( found->client_port );
+-        free( found );
++        release_object( found->client_port );        free( found->conn_data );        free( found );
+         release_object( server_port );
+         return;
+     }
+@@ -569,8 +603,7 @@ DECL_HANDLER(accept_alpc_connection)
+         found->client_async = NULL;
+     }
+ 
+-    release_object( found->client_port );
+-    free( found );
++    release_object( found->client_port );    free( found->conn_data );    free( found );
+     release_object( server_port );
+ }
+ 
+diff --git a/server/protocol.def b/server/protocol.def
+index 0f8b6e0..152a503 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4314,6 +4314,7 @@ enum inproc_sync_type
+     struct async_data   async;          /* async I/O parameters for blocking wait */
+     unsigned int        msg_id;         /* unique message ID for this connect request */
+     VARARG(objattr,object_attributes);  /* object attributes containing port name */
++    VARARG(connect_data,bytes);         /* client's connection message payload */
+ @REPLY
+     obj_handle_t        handle;         /* client-side connection handle */
+     obj_handle_t        wait;           /* handle to wait on if STATUS_PENDING */
+diff --git a/server/request_trace.h b/server/request_trace.h
+index c8dcda4..e5a713f 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3539,6 +3539,7 @@ static void dump_connect_alpc_port_request( const struct connect_alpc_port_reque
+     dump_async_data( " async=", &req->async );
+     fprintf( stderr, ", msg_id=%08x", req->msg_id );
+     dump_varargs_object_attributes( ", objattr=", cur_size );
++    dump_varargs_bytes( ", connect_data=", cur_size );
+ }
+ 
+ static void dump_connect_alpc_port_reply( const struct connect_alpc_port_reply *req )
+-- 
+2.56.0
+

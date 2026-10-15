@@ -1,0 +1,64 @@
+From 0949a786412da61842713c3842d3b1fdd243dea7 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Sat, 13 Jun 2026 21:04:52 +0500
+Subject: [PATCH 2/5] ntdll: Implement NtAlpcImpersonateClientOfPort
+ (in-process impersonation)
+
+CoreMessaging impersonates the connecting client during connection acceptance
+and rejects the connection if impersonation fails. Implement it by duplicating
+the current process token as an impersonation token and applying it to the
+calling thread (correct for the in-process, same-user ALPC registrar case).
+
+With this CoreMessaging accepts the connection (NtAlpcAcceptConnectPort with
+AcceptConnection=1) and WhatsApp progresses past the entire CoreMessaging ALPC
+blocker into WinUI3 XAML startup.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/alpc.c | 32 ++++++++++++++++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/alpc.c b/dlls/ntdll/unix/alpc.c
+index f0d8d0d..a6c65ae 100644
+--- a/dlls/ntdll/unix/alpc.c
++++ b/dlls/ntdll/unix/alpc.c
+@@ -415,6 +415,34 @@ NTSTATUS WINAPI NtAlpcQueryInformation( HANDLE port_handle, ULONG class,
+ NTSTATUS WINAPI NtAlpcImpersonateClientOfPort( HANDLE port_handle,
+                                                 ALPC_PORT_MESSAGE *msg, void *reserved )
+ {
+-    FIXME( "(%p, %p, %p): stub\n", port_handle, msg, reserved );
+-    return STATUS_NOT_IMPLEMENTED;
++    NTSTATUS ret;
++    HANDLE proc_token = NULL, imp_token = NULL;
++    OBJECT_ATTRIBUTES attr;
++    SECURITY_QUALITY_OF_SERVICE qos;
++
++    TRACE( "(%p, %p, %p)\n", port_handle, msg, reserved );
++
++    /* In-process, same-user ALPC: impersonate the client by duplicating our own
++     * process token as an impersonation token and applying it to the current
++     * thread. Servers (e.g. CoreMessaging) impersonate during connection
++     * acceptance and reject the connection if it fails. */
++    if ((ret = NtOpenProcessToken( NtCurrentProcess(), TOKEN_DUPLICATE, &proc_token )))
++        return ret;
++
++    qos.Length              = sizeof(qos);
++    qos.ImpersonationLevel  = SecurityImpersonation;
++    qos.ContextTrackingMode = SECURITY_DYNAMIC_TRACKING;
++    qos.EffectiveOnly       = FALSE;
++    InitializeObjectAttributes( &attr, NULL, 0, NULL, NULL );
++    attr.SecurityQualityOfService = &qos;
++
++    ret = NtDuplicateToken( proc_token, TOKEN_IMPERSONATE | TOKEN_QUERY, &attr,
++                            FALSE, TokenImpersonation, &imp_token );
++    NtClose( proc_token );
++    if (ret) return ret;
++
++    ret = NtSetInformationThread( NtCurrentThread(), ThreadImpersonationToken,
++                                  &imp_token, sizeof(imp_token) );
++    NtClose( imp_token );
++    return ret;
+ }
+-- 
+2.56.0
+

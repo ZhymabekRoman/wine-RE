@@ -1,0 +1,39 @@
+From aa4d10dd40a43f29af10d6e25032d9918a6ce6cc Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Sat, 13 Jun 2026 23:30:53 +0500
+Subject: [PATCH 5/5] server/alpc: Correct per-message PortContext for reply
+ direction
+
+When the server replies on its listening port, the PortContext the receiver
+(client) sees must be the destination client connection's context, not the
+listening port's. Fixes PortContext delivery on the reply path.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ server/alpc.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/server/alpc.c b/server/alpc.c
+index 7e64039..accc300 100644
+--- a/server/alpc.c
++++ b/server/alpc.c
+@@ -312,9 +312,13 @@ static void alpc_fd_write( struct fd *fd, struct async *async, file_pos_t pos )
+     {
+         struct alpc_wire_hdr *hdr;
+         data_size_t blob_size = sizeof(*hdr) + iosb->in_size;
+-        /* context the receiver sees: the connection's per-connection context
+-         * (set at accept on the server-side endpoint). */
+-        client_ptr_t ctx = port->listen_port ? port->peer->port_context : port->port_context;
++        /* context the receiver sees = the per-connection context.
++         * client request: our connection (peer = server side). server reply:
++         * the destination client's connection context. */
++        client_ptr_t ctx;
++        if (port->is_server)      ctx = peer->port_context;
++        else if (port->listen_port) ctx = port->peer->port_context;
++        else                      ctx = port->port_context;
+ 
+         if (!(msg = malloc( sizeof(*msg) + blob_size )))
+         {
+-- 
+2.56.0
+

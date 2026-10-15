@@ -1,0 +1,195 @@
+From 4c0d40d7520c2f24547971922c6e549c8cf97de0 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Sun, 14 Jun 2026 14:11:53 +0500
+Subject: [PATCH 2/9] twinapi.appcore: Implement CoreApplication.Run + minimal
+ CoreApplicationView
+
+Run now drives the UWP view lifecycle: CreateView (gets XAML's
+Microsoft.UI.Xaml.FrameworkView) -> Initialize(CoreApplicationView) ->
+SetWindow -> Load -> Run. Add a minimal ICoreApplicationView
+(CoreWindow/Activated/IsMain/IsHosted). XAML's FrameworkView now runs through
+Initialize; next dependency is a real Windows.UI.Core.CoreWindow for SetWindow.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ dlls/twinapi.appcore/core_application.c | 153 +++++++++++++++++++++++-
+ 1 file changed, 148 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/twinapi.appcore/core_application.c b/dlls/twinapi.appcore/core_application.c
+index d6e9e7c..84521c1 100644
+--- a/dlls/twinapi.appcore/core_application.c
++++ b/dlls/twinapi.appcore/core_application.c
+@@ -119,6 +119,120 @@ static const struct IActivationFactoryVtbl activation_factory_vtbl =
+     activation_factory_ActivateInstance,
+ };
+ 
++/* ICoreApplicationView — a per-process application view (minimal). */
++
++struct core_application_view
++{
++    ICoreApplicationView ICoreApplicationView_iface;
++    LONG ref;
++};
++
++static inline struct core_application_view *impl_from_ICoreApplicationView( ICoreApplicationView *iface )
++{
++    return CONTAINING_RECORD( iface, struct core_application_view, ICoreApplicationView_iface );
++}
++
++static HRESULT WINAPI core_application_view_QueryInterface( ICoreApplicationView *iface, REFIID iid, void **out )
++{
++    struct core_application_view *impl = impl_from_ICoreApplicationView( iface );
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_ICoreApplicationView ))
++    {
++        ICoreApplicationView_AddRef( &impl->ICoreApplicationView_iface );
++        *out = &impl->ICoreApplicationView_iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI core_application_view_AddRef( ICoreApplicationView *iface )
++{
++    struct core_application_view *impl = impl_from_ICoreApplicationView( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI core_application_view_Release( ICoreApplicationView *iface )
++{
++    struct core_application_view *impl = impl_from_ICoreApplicationView( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI core_application_view_GetIids( ICoreApplicationView *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI core_application_view_GetRuntimeClassName( ICoreApplicationView *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI core_application_view_GetTrustLevel( ICoreApplicationView *iface, TrustLevel *level )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI core_application_view_get_CoreWindow( ICoreApplicationView *iface, __x_ABI_CWindows_CUI_CCore_CICoreWindow **value )
++{
++    FIXME( "iface %p, value %p semi-stub.\n", iface, value );
++    if (value) *value = NULL;
++    return S_OK;
++}
++static HRESULT WINAPI core_application_view_add_Activated( ICoreApplicationView *iface,
++        __FITypedEventHandler_2_Windows__CApplicationModel__CCore__CCoreApplicationView_Windows__CApplicationModel__CActivation__CIActivatedEventArgs *handler, EventRegistrationToken *token )
++{
++    FIXME( "iface %p, handler %p, token %p semi-stub.\n", iface, handler, token );
++    if (token) token->value = 0;
++    return S_OK;
++}
++static HRESULT WINAPI core_application_view_remove_Activated( ICoreApplicationView *iface, EventRegistrationToken token )
++{
++    FIXME( "iface %p semi-stub.\n", iface );
++    return S_OK;
++}
++static HRESULT WINAPI core_application_view_get_IsMain( ICoreApplicationView *iface, boolean *value )
++{
++    FIXME( "iface %p, value %p semi-stub.\n", iface, value );
++    if (value) *value = TRUE;
++    return S_OK;
++}
++static HRESULT WINAPI core_application_view_get_IsHosted( ICoreApplicationView *iface, boolean *value )
++{
++    FIXME( "iface %p, value %p semi-stub.\n", iface, value );
++    if (value) *value = FALSE;
++    return S_OK;
++}
++
++static const struct ICoreApplicationViewVtbl core_application_view_vtbl =
++{
++    core_application_view_QueryInterface,
++    core_application_view_AddRef,
++    core_application_view_Release,
++    core_application_view_GetIids,
++    core_application_view_GetRuntimeClassName,
++    core_application_view_GetTrustLevel,
++    core_application_view_get_CoreWindow,
++    core_application_view_add_Activated,
++    core_application_view_remove_Activated,
++    core_application_view_get_IsMain,
++    core_application_view_get_IsHosted,
++};
++
++static ICoreApplicationView *core_application_view_create(void)
++{
++    struct core_application_view *impl;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->ICoreApplicationView_iface.lpVtbl = &core_application_view_vtbl;
++    impl->ref = 1;
++    return &impl->ICoreApplicationView_iface;
++}
++
+ /* ICoreApplication — the static Windows.ApplicationModel.Core.CoreApplication */
+ 
+ static HRESULT WINAPI core_application_QueryInterface( ICoreApplication *iface, REFIID iid, void **out )
+@@ -201,15 +315,44 @@ static HRESULT WINAPI core_application_get_Properties( ICoreApplication *iface,
+ 
+ static HRESULT WINAPI core_application_GetCurrentView( ICoreApplication *iface, ICoreApplicationView **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    if (value) *value = NULL;
+-    return E_NOTIMPL;
++    FIXME( "iface %p, value %p semi-stub.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = core_application_view_create();
++    return *value ? S_OK : E_OUTOFMEMORY;
+ }
+ 
+ static HRESULT WINAPI core_application_Run( ICoreApplication *iface, IFrameworkViewSource *view_source )
+ {
+-    FIXME( "iface %p, view_source %p stub!\n", iface, view_source );
+-    return E_NOTIMPL;
++    ICoreApplicationView *app_view;
++    IFrameworkView *view;
++    HRESULT hr;
++
++    FIXME( "iface %p, view_source %p semi-stub.\n", iface, view_source );
++
++    if (!view_source) return E_INVALIDARG;
++
++    if (FAILED(hr = IFrameworkViewSource_CreateView( view_source, &view )))
++    {
++        ERR( "CreateView failed %#lx.\n", hr );
++        return hr;
++    }
++
++    if (!(app_view = core_application_view_create()))
++    {
++        IFrameworkView_Release( view );
++        return E_OUTOFMEMORY;
++    }
++
++    /* drive the UWP view lifecycle: Initialize -> SetWindow -> Load -> Run */
++    hr = IFrameworkView_Initialize( view, app_view );
++    if (SUCCEEDED(hr)) hr = IFrameworkView_SetWindow( view, NULL );
++    if (SUCCEEDED(hr)) hr = IFrameworkView_Load( view, NULL );
++    if (SUCCEEDED(hr)) hr = IFrameworkView_Run( view );
++    IFrameworkView_Uninitialize( view );
++
++    ICoreApplicationView_Release( app_view );
++    IFrameworkView_Release( view );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI core_application_RunWithActivationFactories( ICoreApplication *iface,
+-- 
+2.56.0
+

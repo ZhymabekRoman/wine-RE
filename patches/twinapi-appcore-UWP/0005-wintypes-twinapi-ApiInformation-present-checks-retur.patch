@@ -1,0 +1,146 @@
+From 56d57110e16840b8899760d5489f484364833204 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Sun, 14 Jun 2026 16:02:47 +0500
+Subject: [PATCH 5/9] wintypes/twinapi: ApiInformation present-checks return
+ TRUE; share CoreApplicationView
+
+ApiInformation.IsTypePresent/IsMethodPresentWithArity/IsEventPresent/
+IsPropertyPresent/IsEnumNamedValuePresent returned E_NOTIMPL -> C++/WinRT
+check_hresult throws during XAML feature-detection; now return TRUE (Wine targets
+a modern API surface). CoreApplication.GetCurrentView + Run now share one
+process-wide CoreApplicationView instance (FrameworkUdk requires identity).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ dlls/twinapi.appcore/core_application.c | 25 +++++++++++++++++--------
+ dlls/wintypes/main.c                    | 21 ++++++++++++++-------
+ 2 files changed, 31 insertions(+), 15 deletions(-)
+
+diff --git a/dlls/twinapi.appcore/core_application.c b/dlls/twinapi.appcore/core_application.c
+index 47a259c..f9bd5f3 100644
+--- a/dlls/twinapi.appcore/core_application.c
++++ b/dlls/twinapi.appcore/core_application.c
+@@ -255,13 +255,22 @@ static const struct ICoreApplicationViewVtbl core_application_view_vtbl =
+     core_application_view_get_IsHosted,
+ };
+ 
+-static ICoreApplicationView *core_application_view_create(void)
++/* Single process-wide CoreApplicationView shared by Run + GetCurrentView; they
++ * MUST return the same object or FrameworkUdk fail-fasts. */
++static ICoreApplicationView *the_application_view;
++
++static ICoreApplicationView *core_application_view_get(void)
+ {
+-    struct core_application_view *impl;
+-    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
+-    impl->ICoreApplicationView_iface.lpVtbl = &core_application_view_vtbl;
+-    impl->ref = 1;
+-    return &impl->ICoreApplicationView_iface;
++    if (!the_application_view)
++    {
++        struct core_application_view *impl;
++        if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++        impl->ICoreApplicationView_iface.lpVtbl = &core_application_view_vtbl;
++        impl->ref = 1;
++        the_application_view = &impl->ICoreApplicationView_iface;
++    }
++    ICoreApplicationView_AddRef( the_application_view );
++    return the_application_view;
+ }
+ 
+ /* ICoreApplication — the static Windows.ApplicationModel.Core.CoreApplication */
+@@ -348,7 +357,7 @@ static HRESULT WINAPI core_application_GetCurrentView( ICoreApplication *iface,
+ {
+     FIXME( "iface %p, value %p semi-stub.\n", iface, value );
+     if (!value) return E_POINTER;
+-    *value = core_application_view_create();
++    *value = core_application_view_get();
+     return *value ? S_OK : E_OUTOFMEMORY;
+ }
+ 
+@@ -368,7 +377,7 @@ static HRESULT WINAPI core_application_Run( ICoreApplication *iface, IFrameworkV
+         return hr;
+     }
+ 
+-    if (!(app_view = core_application_view_create()))
++    if (!(app_view = core_application_view_get()))
+     {
+         IFrameworkView_Release( view );
+         return E_OUTOFMEMORY;
+diff --git a/dlls/wintypes/main.c b/dlls/wintypes/main.c
+index d8aa8b6..fa02be1 100644
+--- a/dlls/wintypes/main.c
++++ b/dlls/wintypes/main.c
+@@ -150,7 +150,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsTypePresent(
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsMethodPresent(
+@@ -177,7 +178,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsMethodPresentWithArit
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEventPresent(
+@@ -189,7 +191,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEventPresent(
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsPropertyPresent(
+@@ -201,7 +204,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsPropertyPresent(
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsReadOnlyPropertyPresent(
+@@ -214,7 +218,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsReadOnlyPropertyPrese
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsWriteablePropertyPresent(
+@@ -226,7 +231,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsWriteablePropertyPres
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEnumNamedValuePresent(
+@@ -238,7 +244,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEnumNamedValuePresent
+     if (!enum_type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsApiContractPresentByMajor(
+-- 
+2.56.0
+

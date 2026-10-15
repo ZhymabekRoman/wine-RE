@@ -1,0 +1,26 @@
+From 3627b9731c7a06e7dce2a17de06821485f985639 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Sun, 14 Jun 2026 16:34:54 +0500
+Subject: [PATCH 6/9] twinapi.appcore: Fix copyright attribution on
+ static_lifetime_map.c
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ dlls/twinapi.appcore/static_lifetime_map.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dlls/twinapi.appcore/static_lifetime_map.c b/dlls/twinapi.appcore/static_lifetime_map.c
+index cc7b3f7..b13600c 100644
+--- a/dlls/twinapi.appcore/static_lifetime_map.c
++++ b/dlls/twinapi.appcore/static_lifetime_map.c
+@@ -1,6 +1,6 @@
+ /* Minimal IMap<HSTRING, IInspectable> for CoreApplication's IStaticLifetime.
+  *
+- * Copyright 2026 for CodeWeavers
++ * Copyright 2026 Zhymabek Roman
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+-- 
+2.56.0
+

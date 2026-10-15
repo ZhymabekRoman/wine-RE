@@ -1,0 +1,123 @@
+From 6339b19beba4167681c33b4f64fd3e97e73f995c Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Sun, 14 Jun 2026 19:09:34 +0500
+Subject: [PATCH 7/9] twinapi.appcore: Add ICoreApplicationUnhandledError to
+ CoreApplication factory
+
+CoreApplication exposes the UnhandledErrorDetected event via ICoreApplicationUnhandledError
+(f0e24ab0); add it to the factory's QueryInterface + a semi-stub event add/remove.
+Part of WinUI3 bring-up (XAML DirectUI::FinalUnhandledErrorDetectedRegistration path).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ dlls/twinapi.appcore/core_application.c | 76 +++++++++++++++++++++++++
+ 1 file changed, 76 insertions(+)
+
+diff --git a/dlls/twinapi.appcore/core_application.c b/dlls/twinapi.appcore/core_application.c
+index f9bd5f3..cdd7967 100644
+--- a/dlls/twinapi.appcore/core_application.c
++++ b/dlls/twinapi.appcore/core_application.c
+@@ -47,6 +47,7 @@ struct factory
+ {
+     IActivationFactory IActivationFactory_iface;
+     ICoreApplication ICoreApplication_iface;
++    ICoreApplicationUnhandledError ICoreApplicationUnhandledError_iface;
+     IStaticLifetime IStaticLifetime_iface;
+     __FIMap_2_HSTRING_IInspectable *static_map;
+     LONG ref;
+@@ -92,6 +93,13 @@ static HRESULT WINAPI activation_factory_QueryInterface( IActivationFactory *ifa
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID( iid, &IID_ICoreApplicationUnhandledError ))
++    {
++        IActivationFactory_AddRef( &impl->IActivationFactory_iface );
++        *out = &impl->ICoreApplicationUnhandledError_iface;
++        return S_OK;
++    }
++
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -514,10 +522,78 @@ static const IStaticLifetimeVtbl static_lifetime_vtbl =
+     static_lifetime_GetCollection,
+ };
+ 
++/* ---- ICoreApplicationUnhandledError: UnhandledErrorDetected event (semi-stub) ----
++ * XAML's DirectUI::FinalUnhandledErrorDetectedRegistration::Register (via FrameworkUdk
++ * FinalUnhandledErrorDetected_RegisterHandler) registers for this event; E_NOINTERFACE
++ * here makes XAML throw + fail-fast during init. */
++
++static inline struct factory *impl_from_ICoreApplicationUnhandledError( ICoreApplicationUnhandledError *iface )
++{
++    return CONTAINING_RECORD( iface, struct factory, ICoreApplicationUnhandledError_iface );
++}
++
++static HRESULT WINAPI unhandled_error_QueryInterface( ICoreApplicationUnhandledError *iface, REFIID iid, void **out )
++{
++    struct factory *impl = impl_from_ICoreApplicationUnhandledError( iface );
++    return IActivationFactory_QueryInterface( &impl->IActivationFactory_iface, iid, out );
++}
++static ULONG WINAPI unhandled_error_AddRef( ICoreApplicationUnhandledError *iface )
++{
++    struct factory *impl = impl_from_ICoreApplicationUnhandledError( iface );
++    return IActivationFactory_AddRef( &impl->IActivationFactory_iface );
++}
++static ULONG WINAPI unhandled_error_Release( ICoreApplicationUnhandledError *iface )
++{
++    struct factory *impl = impl_from_ICoreApplicationUnhandledError( iface );
++    return IActivationFactory_Release( &impl->IActivationFactory_iface );
++}
++static HRESULT WINAPI unhandled_error_GetIids( ICoreApplicationUnhandledError *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI unhandled_error_GetRuntimeClassName( ICoreApplicationUnhandledError *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI unhandled_error_GetTrustLevel( ICoreApplicationUnhandledError *iface, TrustLevel *level )
++{
++    if (level) *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI unhandled_error_add_UnhandledErrorDetected( ICoreApplicationUnhandledError *iface,
++        __FIEventHandler_1_Windows__CApplicationModel__CCore__CUnhandledErrorDetectedEventArgs *handler,
++        EventRegistrationToken *token )
++{
++    FIXME( "iface %p, handler %p, token %p semi-stub.\n", iface, handler, token );
++    if (token) token->value = 0;
++    return S_OK;
++}
++static HRESULT WINAPI unhandled_error_remove_UnhandledErrorDetected( ICoreApplicationUnhandledError *iface,
++        EventRegistrationToken token )
++{
++    FIXME( "iface %p, token %#I64x semi-stub.\n", iface, token.value );
++    return S_OK;
++}
++
++static const struct ICoreApplicationUnhandledErrorVtbl unhandled_error_vtbl =
++{
++    unhandled_error_QueryInterface,
++    unhandled_error_AddRef,
++    unhandled_error_Release,
++    unhandled_error_GetIids,
++    unhandled_error_GetRuntimeClassName,
++    unhandled_error_GetTrustLevel,
++    unhandled_error_add_UnhandledErrorDetected,
++    unhandled_error_remove_UnhandledErrorDetected,
++};
++
+ static struct factory factory =
+ {
+     {&activation_factory_vtbl},
+     {&core_application_vtbl},
++    {&unhandled_error_vtbl},
+     {&static_lifetime_vtbl},
+     NULL,
+     1,
+-- 
+2.56.0
+
