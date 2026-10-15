@@ -1,0 +1,2 @@
+Fixes: [WinAppSDK] Implement NtCreateWaitCompletionPacket/NtAssociateWaitCompletionPacket for CoreMessaging in-process ALPC registrar
+#Depends: ntdll-NtAlpcCreatePort

@@ -1,0 +1,1310 @@
+From 6701ccc21b22e4e6378bc6f30c556dfe5f3a10bc Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Fri, 12 Jun 2026 14:03:50 +0500
+Subject: [PATCH] ntdll/server: Implement basic ALPC port infrastructure
+ (NtAlpcCreatePort et al)
+
+Adds a working server-side ALPC port object (server/alpc.c) plus the
+matching ntdll unix-side syscalls, wired through four new wineserver
+requests: create_alpc_port, connect_alpc_port, accept_alpc_connection
+and disconnect_alpc_port.
+
+Implements NtAlpcCreatePort, NtAlpcConnectPort, NtAlpcAcceptConnectPort,
+NtAlpcDisconnectPort and NtAlpcSendWaitReceivePort with a full
+connect/accept handshake and bidirectional message passing between
+client and server connection endpoints.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/alpc.c         | 345 +++++++++++++++++--
+ include/wine/server_protocol.h |  73 +++-
+ server/Makefile.in             |   1 +
+ server/alpc.c                  | 591 +++++++++++++++++++++++++++++++++
+ server/protocol.def            |  35 ++
+ server/request_handlers.h      |  29 ++
+ server/request_trace.h         |  52 +++
+ 7 files changed, 1092 insertions(+), 34 deletions(-)
+ create mode 100644 server/alpc.c
+
+diff --git a/dlls/ntdll/unix/alpc.c b/dlls/ntdll/unix/alpc.c
+index c708b58..84a11ec 100644
+--- a/dlls/ntdll/unix/alpc.c
++++ b/dlls/ntdll/unix/alpc.c
+@@ -2,6 +2,7 @@
+  * Advanced Local Procedure Call
+  *
+  * Copyright 2026 Zhiyi Zhang for CodeWeavers
++ * Copyright 2024 Zhymabek Roman
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -22,62 +23,340 @@
+ #pragma makedep unix
+ #endif
+ 
++#include <stdarg.h>
++#include <string.h>
++
+ #include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "winternl.h"
+ #include "wine/debug.h"
+ #include "unix_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(alpc);
+ 
+-NTSTATUS WINAPI NtAlpcAcceptConnectPort( HANDLE *communication_port, HANDLE connection_port,
+-                                         DWORD flags, OBJECT_ATTRIBUTES *obj_attr,
+-                                         ALPC_PORT_ATTRIBUTES *port_attr, void *port_context,
+-                                         ALPC_PORT_MESSAGE *send_msg,
+-                                         ALPC_MESSAGE_ATTRIBUTES *send_msg_attr, BOOLEAN accept )
++/* ALPC message types (subset of Windows LPC message types) */
++#define LPC_CONNECTION_REQUEST 11
++
++/* Process-global message id counter. Only needs to be unique within a single
++ * server port's pending-connection list, so a global atomic is fine. */
++static LONG alpc_msg_id_counter;
++
++static unsigned int next_alpc_msg_id(void)
+ {
+-    FIXME( "%p, %p, %#x, %p, %p, %p, %p, %p, %d stub!\n", communication_port, connection_port,
+-           (unsigned int)flags, obj_attr, port_attr, port_context, send_msg, send_msg_attr, accept );
+-    return STATUS_NOT_IMPLEMENTED;
++    return InterlockedIncrement( &alpc_msg_id_counter );
++}
++
++/* Async I/O bookkeeping for ALPC server requests, mirroring file.c's
++ * async_irp / irp_completion pattern so out_data is delivered correctly. */
++struct alpc_async
++{
++    struct async_fileio io;
++    void               *buffer;   /* destination buffer for received data */
++    ULONG               size;     /* size of destination buffer */
++};
++
++static BOOL alpc_async_completion( void *user, ULONG_PTR *info, unsigned int *status )
++{
++    struct alpc_async *async = user;
++
++    if (*status == STATUS_ALERTED)
++    {
++        SERVER_START_REQ( get_async_result )
++        {
++            req->user_arg = wine_server_client_ptr( async );
++            if (async->buffer) wine_server_set_reply( req, async->buffer, async->size );
++            *status = virtual_locked_server_call( req );
++        }
++        SERVER_END_REQ;
++    }
++    release_fileio( &async->io );
++    return TRUE;
+ }
+ 
++/******************************************************************************
++ *           NtAlpcCreatePort  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcCreatePort( HANDLE *port_handle, OBJECT_ATTRIBUTES *obj_attr,
++                                   ALPC_PORT_ATTRIBUTES *port_attr )
++{
++    unsigned int ret;
++    data_size_t len;
++    struct object_attributes *objattr;
++
++    TRACE( "(%p, %p, %p)\n", port_handle, obj_attr, port_attr );
++
++    if (!port_handle) return STATUS_ACCESS_VIOLATION;
++    *port_handle = NULL;
++
++    if ((ret = alloc_object_attributes( obj_attr, &objattr, &len ))) return ret;
++
++    SERVER_START_REQ( create_alpc_port )
++    {
++        req->access      = GENERIC_ALL;
++        req->flags       = port_attr ? port_attr->Flags : 0;
++        req->max_msg_len = port_attr ? (unsigned int)port_attr->MaxMessageLength : 0x1000;
++        wine_server_add_data( req, objattr, len );
++        ret = wine_server_call( req );
++        if (!ret) *port_handle = wine_server_ptr_handle( reply->handle );
++    }
++    SERVER_END_REQ;
++
++    free( objattr );
++    return ret;
++}
++
++
++/******************************************************************************
++ *           NtAlpcConnectPort  (NTDLL.@)
++ */
+ NTSTATUS WINAPI NtAlpcConnectPort( HANDLE *port_handle, UNICODE_STRING *port_name,
+-                                   OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr,
+-                                   DWORD flags, PSID required_server_sid,
+-                                   ALPC_PORT_MESSAGE *connect_msg, SIZE_T *connect_msg_size,
+-                                   ALPC_MESSAGE_ATTRIBUTES *send_msg_attr,
+-                                   ALPC_MESSAGE_ATTRIBUTES *recv_msg_attr, LARGE_INTEGER *timeout )
++                                    OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr,
++                                    DWORD flags, PSID required_server_sid,
++                                    ALPC_PORT_MESSAGE *connect_msg, SIZE_T *connect_msg_size,
++                                    ALPC_MESSAGE_ATTRIBUTES *out_msg_attr,
++                                    ALPC_MESSAGE_ATTRIBUTES *in_msg_attr, LARGE_INTEGER *timeout )
+ {
+-    FIXME( "%p, %s, %p, %p, %#x, %p, %p, %p, %p, %p, %p stub!\n", port_handle,
+-           debugstr_us( port_name ), obj_attr, port_attr, (unsigned int)flags, required_server_sid,
+-           connect_msg, connect_msg_size, send_msg_attr, recv_msg_attr, timeout );
+-    return STATUS_NOT_IMPLEMENTED;
++    unsigned int ret;
++    unsigned int msg_id;
++    HANDLE wait_handle = NULL;
++    OBJECT_ATTRIBUTES port_obj_attr;
++    data_size_t len;
++    struct object_attributes *objattr;
++    struct alpc_async *async;
++    IO_STATUS_BLOCK io = { { STATUS_PENDING } };
++
++    TRACE( "(%p, %s, %p, %p, %#x, %p, %p, %p, %p, %p, %p)\n",
++           port_handle, debugstr_us(port_name), obj_attr, port_attr, (unsigned int)flags,
++           required_server_sid, connect_msg, connect_msg_size,
++           out_msg_attr, in_msg_attr, timeout );
++
++    if (!port_handle) return STATUS_ACCESS_VIOLATION;
++    *port_handle = NULL;
++
++    /* Build object_attributes referencing the port name for the server lookup. */
++    InitializeObjectAttributes( &port_obj_attr, port_name, OBJ_CASE_INSENSITIVE, NULL, NULL );
++    if (obj_attr && obj_attr->RootDirectory)
++        port_obj_attr.RootDirectory = obj_attr->RootDirectory;
++
++    if ((ret = alloc_object_attributes( &port_obj_attr, &objattr, &len ))) return ret;
++
++    if (!(async = (struct alpc_async *)alloc_fileio( sizeof(*async), alpc_async_completion, NULL )))
++    {
++        free( objattr );
++        return STATUS_NO_MEMORY;
++    }
++    async->buffer = NULL;
++    async->size   = 0;
++
++    msg_id = next_alpc_msg_id();
++
++    SERVER_START_REQ( connect_alpc_port )
++    {
++        req->async   = server_async( NULL, &async->io, NULL, NULL, NULL, iosb_client_ptr( &io ) );
++        req->msg_id  = msg_id;
++        wine_server_add_data( req, objattr, len );
++        ret = wine_server_call( req );
++        if (!ret || ret == STATUS_PENDING)
++        {
++            *port_handle = wine_server_ptr_handle( reply->handle );
++            wait_handle  = wine_server_ptr_handle( reply->wait );
++        }
++    }
++    SERVER_END_REQ;
++
++    free( objattr );
++    if (ret != STATUS_PENDING) free( async );
++
++    if (wait_handle)
++    {
++        NtWaitForSingleObject( wait_handle, FALSE, timeout );
++        NtClose( wait_handle );
++        ret = io.Status;
++    }
++
++    if (ret && ret != STATUS_PENDING && *port_handle)
++    {
++        NtClose( *port_handle );
++        *port_handle = NULL;
++    }
++
++    return ret;
+ }
+ 
+-NTSTATUS WINAPI NtAlpcCreatePort( HANDLE *port_handle, OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr )
++
++/******************************************************************************
++ *           NtAlpcAcceptConnectPort  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcAcceptConnectPort( HANDLE *communication_port, HANDLE connection_port,
++                                          DWORD flags, OBJECT_ATTRIBUTES *obj_attr,
++                                          ALPC_PORT_ATTRIBUTES *port_attr, void *port_context,
++                                          ALPC_PORT_MESSAGE *connection_request,
++                                          ALPC_MESSAGE_ATTRIBUTES *connection_msg_attr,
++                                          BOOLEAN accept_connection )
+ {
+-    FIXME( "%p, %p, %p stub!\n", port_handle, obj_attr, port_attr );
+-    return STATUS_NOT_IMPLEMENTED;
++    unsigned int ret;
++    unsigned int msg_id;
++
++    TRACE( "(%p, %p, %#x, %p, %p, %p, %p, %p, %d)\n",
++           communication_port, connection_port, (unsigned int)flags, obj_attr, port_attr,
++           port_context, connection_request, connection_msg_attr, accept_connection );
++
++    if (!communication_port) return STATUS_ACCESS_VIOLATION;
++    *communication_port = NULL;
++    if (!connection_request) return STATUS_INVALID_PARAMETER;
++
++    msg_id = connection_request->MessageId;
++
++    SERVER_START_REQ( accept_alpc_connection )
++    {
++        req->server_port = wine_server_obj_handle( connection_port );
++        req->msg_id      = msg_id;
++        req->accept      = accept_connection;
++        ret = wine_server_call( req );
++        if (!ret && accept_connection)
++            *communication_port = wine_server_ptr_handle( reply->handle );
++    }
++    SERVER_END_REQ;
++
++    return ret;
+ }
+ 
++
++/******************************************************************************
++ *           NtAlpcDisconnectPort  (NTDLL.@)
++ */
+ NTSTATUS WINAPI NtAlpcDisconnectPort( HANDLE port_handle, ULONG flags )
+ {
+-    FIXME( "%p, %#x stub!\n", port_handle, (unsigned int)flags );
+-    return STATUS_NOT_IMPLEMENTED;
++    unsigned int ret;
++
++    TRACE( "(%p, %#x)\n", port_handle, (unsigned int)flags );
++
++    SERVER_START_REQ( disconnect_alpc_port )
++    {
++        req->handle = wine_server_obj_handle( port_handle );
++        ret = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++
++    return ret;
+ }
+ 
+-NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, ULONG flags,
+-                                           ALPC_PORT_MESSAGE *send_msg,
+-                                           ALPC_MESSAGE_ATTRIBUTES *send_msg_attr,
+-                                           ALPC_PORT_MESSAGE *recv_msg, SIZE_T *recv_buffer_size,
+-                                           ALPC_MESSAGE_ATTRIBUTES *recv_msg_attr,
+-                                           LARGE_INTEGER *timeout )
++
++/******************************************************************************
++ *           NtAlpcSendWaitReceivePort  (NTDLL.@)
++ *
++ * Combined send + wait-for-receive on an ALPC port or connection.
++ *
++ * On a SERVER port handle the received data is a wine-internal 8-byte blob
++ * { ULONG is_connect=1, ULONG msg_id }.  We synthesize a proper PORT_MESSAGE
++ * with Type = LPC_CONNECTION_REQUEST so the caller can pass it straight to
++ * NtAlpcAcceptConnectPort.
++ */
++NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, DWORD flags,
++                                            ALPC_PORT_MESSAGE *send_msg,
++                                            ALPC_MESSAGE_ATTRIBUTES *send_msg_attr,
++                                            ALPC_PORT_MESSAGE *recv_msg,
++                                            SIZE_T *recv_buffer_size,
++                                            ALPC_MESSAGE_ATTRIBUTES *recv_msg_attr,
++                                            LARGE_INTEGER *timeout )
+ {
+-    FIXME( "%p, %#x, %p, %p, %p, %p, %p, %p stub!\n", port_handle, (unsigned int)flags, send_msg,
+-           send_msg_attr, recv_msg, recv_buffer_size, recv_msg_attr, timeout );
+-    return STATUS_NOT_IMPLEMENTED;
++    unsigned int ret = STATUS_SUCCESS;
++    HANDLE wait_handle = NULL;
++    struct alpc_async *async;
++    IO_STATUS_BLOCK io = { { STATUS_PENDING } };
++    data_size_t recv_size = recv_buffer_size ? (data_size_t)*recv_buffer_size : 0;
++
++    TRACE( "(%p, %#x, %p, %p, %p, %p, %p, %p)\n",
++           port_handle, (unsigned int)flags, send_msg, send_msg_attr,
++           recv_msg, recv_buffer_size, recv_msg_attr, timeout );
++
++    /* --- Send phase --- */
++    if (send_msg)
++    {
++        data_size_t send_size = send_msg->TotalLength;
++
++        if (!(async = (struct alpc_async *)alloc_fileio( sizeof(*async), alpc_async_completion, port_handle )))
++            return STATUS_NO_MEMORY;
++        async->buffer = NULL;
++        async->size   = 0;
++
++        io.Status = STATUS_PENDING;
++        wait_handle = NULL;
++        SERVER_START_REQ( write )
++        {
++            req->async = server_async( port_handle, &async->io, NULL, NULL, NULL, iosb_client_ptr( &io ) );
++            req->pos   = 0;
++            wine_server_add_data( req, send_msg, send_size );
++            ret = wine_server_call( req );
++            wait_handle = wine_server_ptr_handle( reply->wait );
++        }
++        SERVER_END_REQ;
++
++        if (ret != STATUS_PENDING) free( async );
++        if (wait_handle) ret = wait_async( wait_handle, FALSE );
++
++        if (ret) return ret;
++    }
++
++    if (!recv_msg) return STATUS_SUCCESS;
++
++    /* --- Receive phase --- */
++    if (!(async = (struct alpc_async *)alloc_fileio( sizeof(*async), alpc_async_completion, port_handle )))
++        return STATUS_NO_MEMORY;
++    async->buffer = recv_msg;
++    async->size   = recv_size;
++
++    io.Status = STATUS_PENDING;
++    io.Information = 0;
++    wait_handle = NULL;
++
++    SERVER_START_REQ( read )
++    {
++        req->async = server_async( port_handle, &async->io, NULL, NULL, NULL, iosb_client_ptr( &io ) );
++        req->pos   = 0;
++        wine_server_set_reply( req, recv_msg, recv_size );
++        ret = wine_server_call( req );
++        wait_handle = wine_server_ptr_handle( reply->wait );
++    }
++    SERVER_END_REQ;
++
++    if (ret != STATUS_PENDING) free( async );
++    if (wait_handle)
++    {
++        NtWaitForSingleObject( wait_handle, FALSE, timeout );
++        NtClose( wait_handle );
++        ret = io.Status;
++    }
++
++    if (!ret && recv_buffer_size) *recv_buffer_size = io.Information;
++
++    /* Detect the wine-internal connect notification blob and turn it into a
++     * proper PORT_MESSAGE in-place. */
++    if (!ret && recv_msg && io.Information == 2 * sizeof(ULONG))
++    {
++        ULONG hdr[2];
++        memcpy( hdr, recv_msg, sizeof(hdr) );
++        if (hdr[0] == 1) /* is_connect flag */
++        {
++            memset( recv_msg, 0, sizeof(*recv_msg) );
++            recv_msg->TotalLength = sizeof(*recv_msg);
++            recv_msg->DataLength  = 0;
++            recv_msg->Type        = LPC_CONNECTION_REQUEST;
++            recv_msg->MessageId   = hdr[1];
++            if (recv_buffer_size) *recv_buffer_size = sizeof(*recv_msg);
++        }
++    }
++
++    return ret;
+ }
+ 
+-NTSTATUS WINAPI NtAlpcImpersonateClientOfPort( HANDLE port_handle, ALPC_PORT_MESSAGE *msg, void *reserved )
++
++/******************************************************************************
++ *           NtAlpcImpersonateClientOfPort  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcImpersonateClientOfPort( HANDLE port_handle,
++                                                ALPC_PORT_MESSAGE *msg, void *reserved )
+ {
+-    FIXME( "%p, %p, %p stub!\n", port_handle, msg, reserved );
++    FIXME( "(%p, %p, %p): stub\n", port_handle, msg, reserved );
+     return STATUS_NOT_IMPLEMENTED;
+ }
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 751bc09..7b8c832 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6194,6 +6194,65 @@ struct d3dkmt_mutex_release_reply
+ };
+ 
+ 
++struct create_alpc_port_request
++{
++    struct request_header __header;
++    unsigned int        access;
++    unsigned int        flags;
++    unsigned int        max_msg_len;
++    /* VARARG(objattr,object_attributes); */
++};
++struct create_alpc_port_reply
++{
++    struct reply_header __header;
++    obj_handle_t        handle;
++    char __pad_12[4];
++};
++
++
++struct connect_alpc_port_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++    struct async_data   async;
++    unsigned int        msg_id;
++    /* VARARG(objattr,object_attributes); */
++    char __pad_60[4];
++};
++struct connect_alpc_port_reply
++{
++    struct reply_header __header;
++    obj_handle_t        handle;
++    obj_handle_t        wait;
++};
++
++
++struct accept_alpc_connection_request
++{
++    struct request_header __header;
++    obj_handle_t        server_port;
++    unsigned int        msg_id;
++    int                 accept;
++};
++struct accept_alpc_connection_reply
++{
++    struct reply_header __header;
++    obj_handle_t        handle;
++    char __pad_12[4];
++};
++
++
++struct disconnect_alpc_port_request
++{
++    struct request_header __header;
++    obj_handle_t        handle;
++};
++struct disconnect_alpc_port_reply
++{
++    struct reply_header __header;
++};
++
++
+ enum request
+ {
+     REQ_new_process,
+@@ -6503,6 +6562,10 @@ enum request
+     REQ_d3dkmt_object_open_name,
+     REQ_d3dkmt_mutex_acquire,
+     REQ_d3dkmt_mutex_release,
++    REQ_create_alpc_port,
++    REQ_connect_alpc_port,
++    REQ_accept_alpc_connection,
++    REQ_disconnect_alpc_port,
+     REQ_NB_REQUESTS
+ };
+ 
+@@ -6817,6 +6880,10 @@ union generic_request
+     struct d3dkmt_object_open_name_request d3dkmt_object_open_name_request;
+     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
+     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
++    struct create_alpc_port_request create_alpc_port_request;
++    struct connect_alpc_port_request connect_alpc_port_request;
++    struct accept_alpc_connection_request accept_alpc_connection_request;
++    struct disconnect_alpc_port_request disconnect_alpc_port_request;
+ };
+ union generic_reply
+ {
+@@ -7129,8 +7196,12 @@ union generic_reply
+     struct d3dkmt_object_open_name_reply d3dkmt_object_open_name_reply;
+     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
++    struct create_alpc_port_reply create_alpc_port_reply;
++    struct connect_alpc_port_reply connect_alpc_port_reply;
++    struct accept_alpc_connection_reply accept_alpc_connection_reply;
++    struct disconnect_alpc_port_reply disconnect_alpc_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 942
++#define SERVER_PROTOCOL_VERSION 943
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/Makefile.in b/server/Makefile.in
+index 84a6bd7..0dd5395 100644
+--- a/server/Makefile.in
++++ b/server/Makefile.in
+@@ -1,6 +1,7 @@
+ PROGRAMS = wineserver
+ 
+ SOURCES = \
++	alpc.c \
+ 	async.c \
+ 	atom.c \
+ 	change.c \
+diff --git a/server/alpc.c b/server/alpc.c
+new file mode 100644
+index 0000000..c92f900
+--- /dev/null
++++ b/server/alpc.c
+@@ -0,0 +1,591 @@
++/*
++ * Server-side ALPC port implementation
++ *
++ * Copyright 2024 Zhymabek Roman
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "config.h"
++
++#include <assert.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "winternl.h"
++
++#include "object.h"
++#include "handle.h"
++#include "request.h"
++#include "process.h"
++#include "thread.h"
++#include "file.h"
++
++/* ---- Structures ---- */
++
++/* A queued message (used for both server-port connect notifications and
++ * per-connection data messages). */
++struct alpc_message
++{
++    struct list      entry;
++    unsigned int     msg_id;     /* for connect msgs: the pending-conn id */
++    int              is_connect; /* 1 = connect notification */
++    data_size_t      data_size;  /* size of user data that follows */
++    /* user data bytes follow */
++};
++
++/* A pending (not yet accepted) client connection. */
++struct alpc_pending_conn
++{
++    struct list      entry;          /* in alpc_port::pending_conns */
++    unsigned int     msg_id;         /* same as the connect message id */
++    struct alpc_port *client_port;   /* client-side connection port object */
++    struct async     *client_async;  /* async blocking NtAlpcConnectPort */
++};
++
++struct alpc_port;
++
++struct alpc_port
++{
++    struct object       obj;
++    struct fd          *fd;
++    int                 is_server;   /* 1 = server listening port, 0 = connection */
++
++    /* Message queue – both server ports and connections use this */
++    struct list         msg_queue;
++    struct async_queue  read_q;
++
++    /* Server port only */
++    struct list         pending_conns; /* struct alpc_pending_conn */
++
++    /* Connection only */
++    struct alpc_port   *peer;        /* peer connection endpoint, or NULL */
++};
++
++/* ---- Forward declarations ---- */
++
++static void alpc_port_dump( struct object *obj, int verbose );
++static struct fd *alpc_port_get_fd( struct object *obj );
++static void alpc_port_destroy( struct object *obj );
++static unsigned int alpc_port_map_access( struct object *obj, unsigned int access );
++
++static const struct object_ops alpc_port_ops =
++{
++    sizeof(struct alpc_port),  /* size */
++    &no_type,                  /* type */
++    alpc_port_dump,            /* dump */
++    NULL,                      /* add_queue */
++    NULL,                      /* remove_queue */
++    NULL,                      /* signaled */
++    NULL,                      /* satisfied */
++    no_signal,                 /* signal */
++    alpc_port_get_fd,          /* get_fd */
++    default_fd_get_sync,       /* get_sync */
++    alpc_port_map_access,      /* map_access */
++    default_get_sd,            /* get_sd */
++    default_set_sd,            /* set_sd */
++    default_get_full_name,     /* get_full_name */
++    no_lookup_name,            /* lookup_name */
++    directory_link_name,       /* link_name */
++    default_unlink_name,       /* unlink_name */
++    no_open_file,              /* open_file */
++    no_kernel_obj_list,        /* get_kernel_obj_list */
++    no_close_handle,           /* close_handle */
++    alpc_port_destroy,         /* destroy */
++};
++
++static void alpc_fd_read( struct fd *fd, struct async *async, file_pos_t pos );
++static void alpc_fd_write( struct fd *fd, struct async *async, file_pos_t pos );
++static enum server_fd_type alpc_fd_get_type( struct fd *fd );
++
++static const struct fd_ops alpc_fd_ops =
++{
++    default_fd_get_poll_events,
++    default_poll_event,
++    alpc_fd_get_type,
++    alpc_fd_read,
++    alpc_fd_write,
++    no_fd_flush,
++    default_fd_get_file_info,
++    no_fd_get_volume_info,
++    no_fd_ioctl,
++    default_fd_cancel_async,
++    no_fd_queue_async,
++    default_fd_reselect_async,
++};
++
++/* ---- Object ops ---- */
++
++static void alpc_port_dump( struct object *obj, int verbose )
++{
++    struct alpc_port *port = (struct alpc_port *)obj;
++    fprintf( stderr, "ALPC %s port\n", port->is_server ? "server" : "connection" );
++}
++
++static struct fd *alpc_port_get_fd( struct object *obj )
++{
++    struct alpc_port *port = (struct alpc_port *)obj;
++    return (struct fd *)grab_object( port->fd );
++}
++
++static unsigned int alpc_port_map_access( struct object *obj, unsigned int access )
++{
++    if (access & GENERIC_READ)    access |= FILE_GENERIC_READ;
++    if (access & GENERIC_WRITE)   access |= FILE_GENERIC_WRITE;
++    if (access & GENERIC_EXECUTE) access |= STANDARD_RIGHTS_EXECUTE;
++    if (access & GENERIC_ALL)     access |= FILE_ALL_ACCESS;
++    return access & ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
++}
++
++static void alpc_port_destroy( struct object *obj )
++{
++    struct alpc_port *port = (struct alpc_port *)obj;
++    struct alpc_message *msg, *next_msg;
++
++    if (!port->fd) return; /* creation was aborted before full init */
++
++    async_wake_up( &port->read_q, STATUS_HANDLES_CLOSED );
++    free_async_queue( &port->read_q );
++
++    LIST_FOR_EACH_ENTRY_SAFE( msg, next_msg, &port->msg_queue, struct alpc_message, entry )
++    {
++        list_remove( &msg->entry );
++        free( msg );
++    }
++
++    if (port->is_server)
++    {
++        struct alpc_pending_conn *pc, *next_pc;
++        LIST_FOR_EACH_ENTRY_SAFE( pc, next_pc, &port->pending_conns,
++                                   struct alpc_pending_conn, entry )
++        {
++            list_remove( &pc->entry );
++            if (pc->client_async)
++            {
++                async_terminate( pc->client_async, STATUS_OBJECT_NAME_NOT_FOUND );
++                release_object( pc->client_async );
++            }
++            if (pc->client_port) release_object( pc->client_port );
++            free( pc );
++        }
++    }
++    else if (port->peer)
++    {
++        async_wake_up( &port->peer->read_q, STATUS_PIPE_DISCONNECTED );
++        port->peer->peer = NULL;
++        port->peer = NULL;
++    }
++
++    if (port->fd) release_object( port->fd );
++}
++
++/* ---- Fd ops ---- */
++
++static enum server_fd_type alpc_fd_get_type( struct fd *fd )
++{
++    return FD_TYPE_DEVICE;
++}
++
++/* Deliver queued messages to pending async readers. */
++static void reselect_alpc_port( struct alpc_port *port )
++{
++    struct async *async;
++
++    while (!list_empty( &port->msg_queue )
++           && (async = find_pending_async( &port->read_q )))
++    {
++        struct alpc_message *msg = LIST_ENTRY( list_head(&port->msg_queue),
++                                               struct alpc_message, entry );
++        struct iosb *iosb = async_get_iosb( async );
++
++        if (iosb->out_size < msg->data_size)
++        {
++            async_request_complete( async, STATUS_BUFFER_TOO_SMALL, 0, 0, NULL );
++        }
++        else
++        {
++            void *data = (char *)msg + sizeof(*msg);
++            async_request_complete_alloc( async, STATUS_SUCCESS,
++                                           msg->data_size, msg->data_size, data );
++            list_remove( &msg->entry );
++            free( msg );
++        }
++
++        release_object( iosb );
++        release_object( async );
++    }
++}
++
++static void alpc_fd_read( struct fd *fd, struct async *async, file_pos_t pos )
++{
++    struct alpc_port *port = get_fd_user( fd );
++
++    queue_async( &port->read_q, async );
++    reselect_alpc_port( port );
++    set_error( STATUS_PENDING );
++}
++
++/* Write op: sends a message to the peer connection's queue. */
++static void alpc_fd_write( struct fd *fd, struct async *async, file_pos_t pos )
++{
++    struct alpc_port *port = get_fd_user( fd );
++    struct alpc_port *peer;
++    struct alpc_message *msg;
++    struct iosb *iosb;
++
++    if (port->is_server || !port->peer)
++    {
++        set_error( STATUS_PIPE_DISCONNECTED );
++        return;
++    }
++    peer = port->peer;
++
++    iosb = async_get_iosb( async );
++    if (!iosb->in_data || !iosb->in_size)
++    {
++        release_object( iosb );
++        async_request_complete( async, STATUS_SUCCESS, 0, 0, NULL ); /* zero-length send */
++        return;
++    }
++
++    msg = malloc( sizeof(*msg) + iosb->in_size );
++    if (!msg)
++    {
++        release_object( iosb );
++        set_error( STATUS_NO_MEMORY );
++        return;
++    }
++
++    msg->is_connect = 0;
++    msg->msg_id     = 0;
++    msg->data_size  = iosb->in_size;
++    memcpy( (char *)msg + sizeof(*msg), iosb->in_data, iosb->in_size );
++
++    list_add_tail( &peer->msg_queue, &msg->entry );
++    wake_up( &peer->obj, 0 );
++    reselect_alpc_port( peer );
++
++    async_request_complete( async, STATUS_SUCCESS, iosb->in_size, 0, NULL );
++    release_object( iosb );
++}
++
++/* ---- Helpers ---- */
++
++static struct alpc_port *create_alpc_port_obj( int is_server )
++{
++    struct alpc_port *port;
++    unsigned int opts = FILE_SYNCHRONOUS_IO_NONALERT;
++
++    if (!(port = alloc_object( &alpc_port_ops ))) return NULL;
++
++    port->is_server = is_server;
++    port->peer      = NULL;
++    list_init( &port->msg_queue );
++    init_async_queue( &port->read_q );
++    list_init( &port->pending_conns );
++
++    port->fd = alloc_pseudo_fd( &alpc_fd_ops, &port->obj, opts );
++    if (!port->fd)
++    {
++        release_object( port );
++        return NULL;
++    }
++    return port;
++}
++
++/* Queue a connect-notification message to the server port's msg_queue. */
++static int queue_connect_notification( struct alpc_port *server_port, unsigned int msg_id )
++{
++    struct alpc_message *msg;
++
++    /* The payload is { unsigned int is_connect=1, unsigned int msg_id }
++     * so ntdll can reliably detect this as a connect notification. */
++    {
++        unsigned int hdr[2];
++        msg = malloc( sizeof(*msg) + sizeof(hdr) );
++        if (!msg)
++        {
++            set_error( STATUS_NO_MEMORY );
++            return 0;
++        }
++        hdr[0] = 1; /* is_connect flag */
++        hdr[1] = msg_id;
++        msg->is_connect = 1;
++        msg->msg_id     = msg_id;
++        msg->data_size  = sizeof(hdr);
++        memcpy( (char *)msg + sizeof(*msg), hdr, sizeof(hdr) );
++    }
++
++    list_add_tail( &server_port->msg_queue, &msg->entry );
++    wake_up( &server_port->obj, 0 );
++    reselect_alpc_port( server_port );
++    return 1;
++}
++
++/* ---- Request handlers ---- */
++
++DECL_HANDLER(create_alpc_port)
++{
++    struct alpc_port *port;
++    struct unicode_str name;
++    struct object *root;
++    const struct security_descriptor *sd;
++    const struct object_attributes *objattr = get_req_object_attributes( &sd, &name, &root );
++
++    if (!objattr) return;
++
++    port = create_named_object( root, &alpc_port_ops, &name, objattr->attributes, sd );
++    if (root) release_object( root );
++    if (!port) return;
++
++    if (get_error() != STATUS_OBJECT_NAME_EXISTS)
++    {
++        /* Newly created: initialize all fields */
++        port->is_server = 1;
++        port->peer      = NULL;
++        list_init( &port->msg_queue );
++        init_async_queue( &port->read_q );
++        list_init( &port->pending_conns );
++        port->fd = alloc_pseudo_fd( &alpc_fd_ops, &port->obj, FILE_SYNCHRONOUS_IO_NONALERT );
++        if (!port->fd)
++        {
++            release_object( port );
++            return;
++        }
++    }
++
++    reply->handle = alloc_handle( current->process, port, req->access, objattr->attributes );
++    release_object( port );
++}
++
++DECL_HANDLER(connect_alpc_port)
++{
++    struct alpc_port *server_port;
++    struct alpc_port *client_port;
++    struct alpc_pending_conn *pc;
++    struct unicode_str name;
++    struct object *root;
++    const struct security_descriptor *sd;
++    const struct object_attributes *objattr = get_req_object_attributes( &sd, &name, &root );
++
++    if (!objattr) return;
++
++    /* Look up the named server port */
++    server_port = (struct alpc_port *)open_named_object(
++                        root, &alpc_port_ops, &name, objattr->attributes );
++    if (root) release_object( root );
++
++    if (!server_port) return; /* set_error already set by open_named_object */
++
++    if (!server_port->is_server)
++    {
++        release_object( server_port );
++        set_error( STATUS_OBJECT_TYPE_MISMATCH );
++        return;
++    }
++
++    /* Create client-side connection endpoint */
++    if (!(client_port = create_alpc_port_obj( 0 )))
++    {
++        release_object( server_port );
++        return;
++    }
++
++    /* Allocate pending-connection record */
++    pc = malloc( sizeof(*pc) );
++    if (!pc)
++    {
++        release_object( client_port );
++        release_object( server_port );
++        set_error( STATUS_NO_MEMORY );
++        return;
++    }
++    pc->msg_id       = req->msg_id;
++    pc->client_port  = (struct alpc_port *)grab_object( client_port );
++    pc->client_async = NULL;
++
++    /* Create handle for client now; peer will be wired up after accept */
++    reply->handle = alloc_handle( current->process, client_port, GENERIC_ALL, 0 );
++    if (!reply->handle)
++    {
++        release_object( client_port );
++        free( pc );
++        release_object( server_port );
++        return;
++    }
++
++    /* Queue connect notification to server port */
++    list_add_tail( &server_port->pending_conns, &pc->entry );
++    if (!queue_connect_notification( server_port, req->msg_id ))
++    {
++        list_remove( &pc->entry );
++        close_handle( current->process, reply->handle );
++        reply->handle = 0;
++        release_object( client_port );
++        free( pc );
++        release_object( server_port );
++        return;
++    }
++
++    /* Block client until server calls accept_alpc_connection */
++    {
++        struct async *async = create_request_async( client_port->fd,
++                                                     get_fd_comp_flags(client_port->fd),
++                                                     &req->async, 0 );
++        if (async)
++        {
++            pc->client_async = (struct async *)grab_object( async );
++            /* leave async pending; it is completed later by accept_alpc_connection.
++             * async_handoff returns the proper wait handle for the client. */
++            set_error( STATUS_PENDING );
++            reply->wait = async_handoff( async, NULL, 1 );
++            release_object( async );
++        }
++        else
++        {
++            /* Allocation failure: clean up */
++            list_remove( &pc->entry );
++            /* connect notification already queued; remove from server msg queue */
++            {
++                struct alpc_message *m, *next;
++                LIST_FOR_EACH_ENTRY_SAFE( m, next, &server_port->msg_queue,
++                                           struct alpc_message, entry )
++                {
++                    if (m->is_connect && m->msg_id == req->msg_id)
++                    {
++                        list_remove( &m->entry );
++                        free( m );
++                        break;
++                    }
++                }
++            }
++            close_handle( current->process, reply->handle );
++            reply->handle = 0;
++            release_object( client_port );
++            free( pc );
++        }
++    }
++
++    release_object( client_port );
++    release_object( server_port );
++}
++
++DECL_HANDLER(accept_alpc_connection)
++{
++    struct alpc_port *server_port;
++    struct alpc_pending_conn *pc, *found = NULL;
++    struct alpc_port *server_conn_port;
++
++    server_port = (struct alpc_port *)get_handle_obj( current->process,
++                                                       req->server_port,
++                                                       0, &alpc_port_ops );
++    if (!server_port) return;
++
++    if (!server_port->is_server)
++    {
++        release_object( server_port );
++        set_error( STATUS_INVALID_PARAMETER );
++        return;
++    }
++
++    /* Find pending connection by msg_id */
++    LIST_FOR_EACH_ENTRY( pc, &server_port->pending_conns, struct alpc_pending_conn, entry )
++    {
++        if (pc->msg_id == req->msg_id)
++        {
++            found = pc;
++            break;
++        }
++    }
++
++    if (!found)
++    {
++        release_object( server_port );
++        set_error( STATUS_NOT_FOUND );
++        return;
++    }
++
++    list_remove( &found->entry );
++
++    if (!req->accept)
++    {
++        /* Reject */
++        if (found->client_async)
++        {
++            async_terminate( found->client_async, STATUS_CONNECTION_REFUSED );
++            release_object( found->client_async );
++        }
++        release_object( found->client_port );
++        free( found );
++        release_object( server_port );
++        return;
++    }
++
++    /* Create server-side connection endpoint and wire up the peer links */
++    if (!(server_conn_port = create_alpc_port_obj( 0 )))
++    {
++        if (found->client_async)
++        {
++            async_terminate( found->client_async, STATUS_NO_MEMORY );
++            release_object( found->client_async );
++        }
++        release_object( found->client_port );
++        free( found );
++        release_object( server_port );
++        return;
++    }
++
++    server_conn_port->peer  = (struct alpc_port *)grab_object( found->client_port );
++    found->client_port->peer = (struct alpc_port *)grab_object( server_conn_port );
++
++    reply->handle = alloc_handle( current->process, server_conn_port,
++                                   GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
++    release_object( server_conn_port );
++
++    /* Wake blocked client */
++    if (found->client_async)
++    {
++        async_request_complete( found->client_async, STATUS_SUCCESS, 0, 0, NULL );
++        release_object( found->client_async );
++        found->client_async = NULL;
++    }
++
++    release_object( found->client_port );
++    free( found );
++    release_object( server_port );
++}
++
++DECL_HANDLER(disconnect_alpc_port)
++{
++    struct alpc_port *port = (struct alpc_port *)get_handle_obj( current->process,
++                                                                   req->handle,
++                                                                   0, &alpc_port_ops );
++    if (!port) return;
++
++    if (!port->is_server && port->peer)
++    {
++        async_wake_up( &port->peer->read_q, STATUS_PIPE_DISCONNECTED );
++        release_object( port->peer->peer ); /* release client's ref to server */
++        port->peer->peer = NULL;
++        release_object( port->peer );
++        port->peer = NULL;
++    }
++
++    release_object( port );
++}
+diff --git a/server/protocol.def b/server/protocol.def
+index 4f4f90c..60e8835 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4297,3 +4297,38 @@ enum inproc_sync_type
+     data_size_t         runtime_size;   /* size of client runtime data */
+     VARARG(runtime,bytes);              /* client runtime data */
+ @END
++
++
++/* Create an ALPC server port */
++@REQ(create_alpc_port)
++    unsigned int        access;         /* desired access */
++    unsigned int        flags;          /* port attribute flags */
++    unsigned int        max_msg_len;    /* maximum message length */
++    VARARG(objattr,object_attributes);  /* object attributes with name */
++@REPLY
++    obj_handle_t        handle;         /* server port handle */
++@END
++
++/* Connect to a named ALPC server port (client side) */
++@REQ(connect_alpc_port)
++    async_data_t        async;          /* async I/O parameters for blocking wait */
++    unsigned int        msg_id;         /* unique message ID for this connect request */
++    VARARG(objattr,object_attributes);  /* object attributes containing port name */
++@REPLY
++    obj_handle_t        handle;         /* client-side connection handle */
++    obj_handle_t        wait;           /* handle to wait on if STATUS_PENDING */
++@END
++
++/* Accept a pending ALPC connection (server side) */
++@REQ(accept_alpc_connection)
++    obj_handle_t        server_port;    /* server listening port handle */
++    unsigned int        msg_id;         /* msg_id from the received connect notification */
++    int                 accept;         /* 1 = accept, 0 = reject */
++@REPLY
++    obj_handle_t        handle;         /* server-side connection handle */
++@END
++
++/* Disconnect an ALPC port or connection */
++@REQ(disconnect_alpc_port)
++    obj_handle_t        handle;         /* ALPC port or connection handle */
++@END
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 0d7a66e..2bcbafb 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -314,6 +314,10 @@ DECL_HANDLER(d3dkmt_share_objects);
+ DECL_HANDLER(d3dkmt_object_open_name);
+ DECL_HANDLER(d3dkmt_mutex_acquire);
+ DECL_HANDLER(d3dkmt_mutex_release);
++DECL_HANDLER(create_alpc_port);
++DECL_HANDLER(connect_alpc_port);
++DECL_HANDLER(accept_alpc_connection);
++DECL_HANDLER(disconnect_alpc_port);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+@@ -625,6 +629,10 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_d3dkmt_object_open_name,
+     (req_handler)req_d3dkmt_mutex_acquire,
+     (req_handler)req_d3dkmt_mutex_release,
++    (req_handler)req_create_alpc_port,
++    (req_handler)req_connect_alpc_port,
++    (req_handler)req_accept_alpc_connection,
++    (req_handler)req_disconnect_alpc_port,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+@@ -2382,3 +2390,24 @@ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, key_value) == 20 );
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, fence_value) == 24 );
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, runtime_size) == 32 );
+ C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
++C_ASSERT( offsetof(struct create_alpc_port_request, access) == 12 );
++C_ASSERT( offsetof(struct create_alpc_port_request, flags) == 16 );
++C_ASSERT( offsetof(struct create_alpc_port_request, max_msg_len) == 20 );
++C_ASSERT( sizeof(struct create_alpc_port_request) == 24 );
++C_ASSERT( offsetof(struct create_alpc_port_reply, handle) == 8 );
++C_ASSERT( sizeof(struct create_alpc_port_reply) == 16 );
++C_ASSERT( offsetof(struct connect_alpc_port_request, async) == 16 );
++C_ASSERT( offsetof(struct connect_alpc_port_request, msg_id) == 56 );
++C_ASSERT( sizeof(struct connect_alpc_port_request) == 64 );
++C_ASSERT( offsetof(struct connect_alpc_port_reply, handle) == 8 );
++C_ASSERT( offsetof(struct connect_alpc_port_reply, wait) == 12 );
++C_ASSERT( sizeof(struct connect_alpc_port_reply) == 16 );
++C_ASSERT( offsetof(struct accept_alpc_connection_request, server_port) == 12 );
++C_ASSERT( offsetof(struct accept_alpc_connection_request, msg_id) == 16 );
++C_ASSERT( offsetof(struct accept_alpc_connection_request, accept) == 20 );
++C_ASSERT( sizeof(struct accept_alpc_connection_request) == 24 );
++C_ASSERT( offsetof(struct accept_alpc_connection_reply, handle) == 8 );
++C_ASSERT( sizeof(struct accept_alpc_connection_reply) == 16 );
++C_ASSERT( offsetof(struct disconnect_alpc_port_request, handle) == 12 );
++C_ASSERT( sizeof(struct disconnect_alpc_port_request) == 16 );
++C_ASSERT( sizeof(struct disconnect_alpc_port_reply) == 8 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 65c7530..7e95707 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3521,6 +3521,46 @@ static void dump_d3dkmt_mutex_release_request( const struct d3dkmt_mutex_release
+     dump_varargs_bytes( ", runtime=", cur_size );
+ }
+ 
++static void dump_create_alpc_port_request( const struct create_alpc_port_request *req )
++{
++    fprintf( stderr, " access=%08x", req->access );
++    fprintf( stderr, ", flags=%08x", req->flags );
++    fprintf( stderr, ", max_msg_len=%u", req->max_msg_len );
++    dump_varargs_object_attributes( ", objattr=", cur_size );
++}
++static void dump_create_alpc_port_reply( const struct create_alpc_port_reply *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++}
++static void dump_connect_alpc_port_request( const struct connect_alpc_port_request *req )
++{
++    dump_async_data( " async=", &req->async );
++    fprintf( stderr, ", msg_id=%08x", req->msg_id );
++    dump_varargs_object_attributes( ", objattr=", cur_size );
++}
++static void dump_connect_alpc_port_reply( const struct connect_alpc_port_reply *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", wait=%04x", req->wait );
++}
++static void dump_accept_alpc_connection_request( const struct accept_alpc_connection_request *req )
++{
++    fprintf( stderr, " server_port=%04x", req->server_port );
++    fprintf( stderr, ", msg_id=%08x", req->msg_id );
++    fprintf( stderr, ", accept=%d", req->accept );
++}
++static void dump_accept_alpc_connection_reply( const struct accept_alpc_connection_reply *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++}
++static void dump_disconnect_alpc_port_request( const struct disconnect_alpc_port_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++}
++static void dump_disconnect_alpc_port_reply( const struct disconnect_alpc_port_reply *req )
++{
++}
++
+ typedef void (*dump_func)( const void *req );
+ 
+ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+@@ -3832,6 +3872,10 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_d3dkmt_object_open_name_request,
+     (dump_func)dump_d3dkmt_mutex_acquire_request,
+     (dump_func)dump_d3dkmt_mutex_release_request,
++    (dump_func)dump_create_alpc_port_request,
++    (dump_func)dump_connect_alpc_port_request,
++    (dump_func)dump_accept_alpc_connection_request,
++    (dump_func)dump_disconnect_alpc_port_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+@@ -4143,6 +4187,10 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_d3dkmt_object_open_name_reply,
+     (dump_func)dump_d3dkmt_mutex_acquire_reply,
+     NULL,
++    (dump_func)dump_create_alpc_port_reply,
++    (dump_func)dump_connect_alpc_port_reply,
++    (dump_func)dump_accept_alpc_connection_reply,
++    NULL,
+ };
+ 
+ static const char * const req_names[REQ_NB_REQUESTS] =
+@@ -4454,6 +4502,10 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "d3dkmt_object_open_name",
+     "d3dkmt_mutex_acquire",
+     "d3dkmt_mutex_release",
++    "create_alpc_port",
++    "connect_alpc_port",
++    "accept_alpc_connection",
++    "disconnect_alpc_port",
+ };
+ 
+ static const struct
+-- 
+2.54.0
+

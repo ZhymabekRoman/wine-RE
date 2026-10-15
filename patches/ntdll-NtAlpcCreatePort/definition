@@ -1,0 +1,2 @@
+Fixes: [WhatsApp] Implement basic NtAlpcCreatePort/NtAlpcConnectPort ALPC infrastructure
+#Depends:

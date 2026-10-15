@@ -1,2 +1,4 @@
 staging/wine
 *.pyc
+.playwright-mcp/
+.serena/

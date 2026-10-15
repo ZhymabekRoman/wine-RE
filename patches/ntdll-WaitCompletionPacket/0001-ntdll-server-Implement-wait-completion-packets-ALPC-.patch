@@ -1,0 +1,1327 @@
+From 3c2092fb34d91ed552334137d42c49886ce63da0 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <s.salkimbaev@abaiuniversity.edu.kz>
+Date: Fri, 12 Jun 2026 14:43:14 +0500
+Subject: [PATCH] ntdll/server: Implement wait completion packets + ALPC
+ integration
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implements NtCreateWaitCompletionPacket, NtAssociateWaitCompletionPacket
+and NtCancelWaitCompletionPacket (previously absent in Wine), backed by a
+new server-side wait_completion_packet object. When an associated target
+object signals, an I/O completion packet is posted to the bound completion
+port — the mechanism WinAppSDK CoreMessaging uses to service its in-process
+ALPC registrar.
+
+ALPC server ports now notify associated wait completion packets when a
+connection request arrives, so a CoreMessaging-style registrar parked on
+NtRemoveIoCompletionEx wakes, receives the connection via
+NtAlpcSendWaitReceivePort and accepts it.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ dlls/ntdll/ntdll.spec          |   6 +
+ dlls/ntdll/ntsyscalls.h        | 606 +++++++++++++++++----------------
+ dlls/ntdll/unix/alpc.c         |   6 +
+ dlls/ntdll/unix/sync.c         |  82 +++++
+ include/wine/server_protocol.h |  62 +++-
+ include/winternl.h             |   3 +
+ server/alpc.c                  |   3 +
+ server/completion.c            | 164 +++++++++
+ server/file.h                  |   1 +
+ server/protocol.def            |  32 +-
+ server/request_handlers.h      |  26 +-
+ server/request_trace.h         |  54 ++-
+ 12 files changed, 740 insertions(+), 305 deletions(-)
+
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 0b6d9b2..3acf722 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -161,6 +161,9 @@
+ @ stdcall -syscall NtAlpcDisconnectPort(ptr long)
+ @ stdcall -syscall NtAlpcImpersonateClientOfPort(ptr ptr ptr)
+ @ stdcall -syscall NtAlpcSendWaitReceivePort(ptr long ptr ptr ptr ptr ptr ptr)
++@ stdcall -syscall NtAssociateWaitCompletionPacket(ptr ptr ptr ptr ptr long ptr ptr)
++@ stdcall -syscall NtCancelWaitCompletionPacket(ptr long)
++@ stdcall -syscall NtCreateWaitCompletionPacket(ptr long ptr)
+ @ stub -syscall=0x004c NtApphelpCacheControl
+ @ stdcall -syscall NtAreMappedFilesTheSame(ptr ptr)
+ @ stdcall -syscall NtAssignProcessToJobObject(long long)
+@@ -1241,6 +1244,9 @@
+ @ stdcall -private ZwAlpcDisconnectPort(ptr long) NtAlpcDisconnectPort
+ @ stdcall -private ZwAlpcImpersonateClientOfPort(ptr ptr ptr) NtAlpcImpersonateClientOfPort
+ @ stdcall -private ZwAlpcSendWaitReceivePort(ptr long ptr ptr ptr ptr ptr ptr) NtAlpcSendWaitReceivePort
++@ stdcall -private ZwAssociateWaitCompletionPacket(ptr ptr ptr ptr ptr long ptr ptr) NtAssociateWaitCompletionPacket
++@ stdcall -private ZwCancelWaitCompletionPacket(ptr long) NtCancelWaitCompletionPacket
++@ stdcall -private ZwCreateWaitCompletionPacket(ptr long ptr) NtCreateWaitCompletionPacket
+ @ stdcall -private ZwApphelpCacheControl() NtApphelpCacheControl
+ @ stdcall -private ZwAreMappedFilesTheSame(ptr ptr) NtAreMappedFilesTheSame
+ @ stdcall -private ZwAssignProcessToJobObject(long long) NtAssignProcessToJobObject
+diff --git a/dlls/ntdll/ntsyscalls.h b/dlls/ntdll/ntsyscalls.h
+index 05b121f..a1c0738 100644
+--- a/dlls/ntdll/ntsyscalls.h
++++ b/dlls/ntdll/ntsyscalls.h
+@@ -117,160 +117,163 @@
+     SYSCALL_ENTRY( 0x0071, NtAlpcSendWaitReceivePort, 32 ) \
+     SYSCALL_ENTRY( 0x0072, NtAreMappedFilesTheSame, 8 ) \
+     SYSCALL_ENTRY( 0x0073, NtAssignProcessToJobObject, 8 ) \
+-    SYSCALL_ENTRY( 0x0074, NtCancelIoFileEx, 12 ) \
+-    SYSCALL_ENTRY( 0x0075, NtCancelSynchronousIoFile, 12 ) \
+-    SYSCALL_ENTRY( 0x0076, NtCommitTransaction, 8 ) \
+-    SYSCALL_ENTRY( 0x0077, NtCompareObjects, 8 ) \
+-    SYSCALL_ENTRY( 0x0078, NtCompareTokens, 12 ) \
+-    SYSCALL_ENTRY( 0x0079, NtCompleteConnectPort, 4 ) \
+-    SYSCALL_ENTRY( 0x007a, NtConnectPort, 32 ) \
+-    SYSCALL_ENTRY( 0x007b, NtContinueEx, 8 ) \
+-    SYSCALL_ENTRY( 0x007c, NtConvertBetweenAuxiliaryCounterAndPerformanceCounter, 16 ) \
+-    SYSCALL_ENTRY( 0x007d, NtCreateDirectoryObject, 12 ) \
+-    SYSCALL_ENTRY( 0x007e, NtCreateIoCompletion, 16 ) \
+-    SYSCALL_ENTRY( 0x007f, NtCreateJobObject, 12 ) \
+-    SYSCALL_ENTRY( 0x0080, NtCreateKeyTransacted, 32 ) \
+-    SYSCALL_ENTRY( 0x0081, NtCreateKeyedEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x0082, NtCreateLowBoxToken, 36 ) \
+-    SYSCALL_ENTRY( 0x0083, NtCreateMailslotFile, 32 ) \
+-    SYSCALL_ENTRY( 0x0084, NtCreateMutant, 16 ) \
+-    SYSCALL_ENTRY( 0x0085, NtCreateNamedPipeFile, 56 ) \
+-    SYSCALL_ENTRY( 0x0086, NtCreatePagingFile, 16 ) \
+-    SYSCALL_ENTRY( 0x0087, NtCreatePort, 20 ) \
+-    SYSCALL_ENTRY( 0x0088, NtCreateSectionEx, 36 ) \
+-    SYSCALL_ENTRY( 0x0089, NtCreateSemaphore, 20 ) \
+-    SYSCALL_ENTRY( 0x008a, NtCreateSymbolicLinkObject, 16 ) \
+-    SYSCALL_ENTRY( 0x008b, NtCreateThreadEx, 44 ) \
+-    SYSCALL_ENTRY( 0x008c, NtCreateTimer, 16 ) \
+-    SYSCALL_ENTRY( 0x008d, NtCreateToken, 52 ) \
+-    SYSCALL_ENTRY( 0x008e, NtCreateTransaction, 40 ) \
+-    SYSCALL_ENTRY( 0x008f, NtCreateUserProcess, 44 ) \
+-    SYSCALL_ENTRY( 0x0090, NtDebugActiveProcess, 8 ) \
+-    SYSCALL_ENTRY( 0x0091, NtDebugContinue, 12 ) \
+-    SYSCALL_ENTRY( 0x0092, NtDeleteAtom, 4 ) \
+-    SYSCALL_ENTRY( 0x0093, NtDeleteFile, 4 ) \
+-    SYSCALL_ENTRY( 0x0094, NtDeleteKey, 4 ) \
+-    SYSCALL_ENTRY( 0x0095, NtDeleteValueKey, 8 ) \
+-    SYSCALL_ENTRY( 0x0096, NtDisplayString, 4 ) \
+-    SYSCALL_ENTRY( 0x0097, NtFilterToken, 24 ) \
+-    SYSCALL_ENTRY( 0x0098, NtFlushBuffersFileEx, 20 ) \
+-    SYSCALL_ENTRY( 0x0099, NtFlushInstructionCache, 12 ) \
+-    SYSCALL_ENTRY( 0x009a, NtFlushKey, 4 ) \
+-    SYSCALL_ENTRY( 0x009b, NtFlushProcessWriteBuffers, 0 ) \
+-    SYSCALL_ENTRY( 0x009c, NtFlushVirtualMemory, 16 ) \
+-    SYSCALL_ENTRY( 0x009d, NtGetContextThread, 8 ) \
+-    SYSCALL_ENTRY( 0x009e, NtGetCurrentProcessorNumber, 0 ) \
+-    SYSCALL_ENTRY( 0x009f, NtGetNextProcess, 20 ) \
+-    SYSCALL_ENTRY( 0x00a0, NtGetNextThread, 24 ) \
+-    SYSCALL_ENTRY( 0x00a1, NtGetNlsSectionPtr, 20 ) \
+-    SYSCALL_ENTRY( 0x00a2, NtGetWriteWatch, 28 ) \
+-    SYSCALL_ENTRY( 0x00a3, NtImpersonateAnonymousToken, 4 ) \
+-    SYSCALL_ENTRY( 0x00a4, NtInitializeNlsFiles, 12 ) \
+-    SYSCALL_ENTRY( 0x00a5, NtInitiatePowerAction, 16 ) \
++    SYSCALL_ENTRY( 0x0074, NtAssociateWaitCompletionPacket, 32 ) \
++    SYSCALL_ENTRY( 0x0075, NtCancelIoFileEx, 12 ) \
++    SYSCALL_ENTRY( 0x0076, NtCancelSynchronousIoFile, 12 ) \
++    SYSCALL_ENTRY( 0x0077, NtCancelWaitCompletionPacket, 8 ) \
++    SYSCALL_ENTRY( 0x0078, NtCommitTransaction, 8 ) \
++    SYSCALL_ENTRY( 0x0079, NtCompareObjects, 8 ) \
++    SYSCALL_ENTRY( 0x007a, NtCompareTokens, 12 ) \
++    SYSCALL_ENTRY( 0x007b, NtCompleteConnectPort, 4 ) \
++    SYSCALL_ENTRY( 0x007c, NtConnectPort, 32 ) \
++    SYSCALL_ENTRY( 0x007d, NtContinueEx, 8 ) \
++    SYSCALL_ENTRY( 0x007e, NtConvertBetweenAuxiliaryCounterAndPerformanceCounter, 16 ) \
++    SYSCALL_ENTRY( 0x007f, NtCreateDirectoryObject, 12 ) \
++    SYSCALL_ENTRY( 0x0080, NtCreateIoCompletion, 16 ) \
++    SYSCALL_ENTRY( 0x0081, NtCreateJobObject, 12 ) \
++    SYSCALL_ENTRY( 0x0082, NtCreateKeyTransacted, 32 ) \
++    SYSCALL_ENTRY( 0x0083, NtCreateKeyedEvent, 16 ) \
++    SYSCALL_ENTRY( 0x0084, NtCreateLowBoxToken, 36 ) \
++    SYSCALL_ENTRY( 0x0085, NtCreateMailslotFile, 32 ) \
++    SYSCALL_ENTRY( 0x0086, NtCreateMutant, 16 ) \
++    SYSCALL_ENTRY( 0x0087, NtCreateNamedPipeFile, 56 ) \
++    SYSCALL_ENTRY( 0x0088, NtCreatePagingFile, 16 ) \
++    SYSCALL_ENTRY( 0x0089, NtCreatePort, 20 ) \
++    SYSCALL_ENTRY( 0x008a, NtCreateSectionEx, 36 ) \
++    SYSCALL_ENTRY( 0x008b, NtCreateSemaphore, 20 ) \
++    SYSCALL_ENTRY( 0x008c, NtCreateSymbolicLinkObject, 16 ) \
++    SYSCALL_ENTRY( 0x008d, NtCreateThreadEx, 44 ) \
++    SYSCALL_ENTRY( 0x008e, NtCreateTimer, 16 ) \
++    SYSCALL_ENTRY( 0x008f, NtCreateToken, 52 ) \
++    SYSCALL_ENTRY( 0x0090, NtCreateTransaction, 40 ) \
++    SYSCALL_ENTRY( 0x0091, NtCreateUserProcess, 44 ) \
++    SYSCALL_ENTRY( 0x0092, NtCreateWaitCompletionPacket, 12 ) \
++    SYSCALL_ENTRY( 0x0093, NtDebugActiveProcess, 8 ) \
++    SYSCALL_ENTRY( 0x0094, NtDebugContinue, 12 ) \
++    SYSCALL_ENTRY( 0x0095, NtDeleteAtom, 4 ) \
++    SYSCALL_ENTRY( 0x0096, NtDeleteFile, 4 ) \
++    SYSCALL_ENTRY( 0x0097, NtDeleteKey, 4 ) \
++    SYSCALL_ENTRY( 0x0098, NtDeleteValueKey, 8 ) \
++    SYSCALL_ENTRY( 0x0099, NtDisplayString, 4 ) \
++    SYSCALL_ENTRY( 0x009a, NtFilterToken, 24 ) \
++    SYSCALL_ENTRY( 0x009b, NtFlushBuffersFileEx, 20 ) \
++    SYSCALL_ENTRY( 0x009c, NtFlushInstructionCache, 12 ) \
++    SYSCALL_ENTRY( 0x009d, NtFlushKey, 4 ) \
++    SYSCALL_ENTRY( 0x009e, NtFlushProcessWriteBuffers, 0 ) \
++    SYSCALL_ENTRY( 0x009f, NtFlushVirtualMemory, 16 ) \
++    SYSCALL_ENTRY( 0x00a0, NtGetContextThread, 8 ) \
++    SYSCALL_ENTRY( 0x00a1, NtGetCurrentProcessorNumber, 0 ) \
++    SYSCALL_ENTRY( 0x00a2, NtGetNextProcess, 20 ) \
++    SYSCALL_ENTRY( 0x00a3, NtGetNextThread, 24 ) \
++    SYSCALL_ENTRY( 0x00a4, NtGetNlsSectionPtr, 20 ) \
++    SYSCALL_ENTRY( 0x00a5, NtGetWriteWatch, 28 ) \
+     SYSCALL_ENTRY( 0x00a6, NtCreateDebugObject, 16 ) \
+-    SYSCALL_ENTRY( 0x00a7, NtListenPort, 8 ) \
+-    SYSCALL_ENTRY( 0x00a8, NtLoadDriver, 4 ) \
+-    SYSCALL_ENTRY( 0x00a9, NtLoadKey, 8 ) \
+-    SYSCALL_ENTRY( 0x00aa, NtLoadKey2, 12 ) \
+-    SYSCALL_ENTRY( 0x00ab, NtLoadKeyEx, 32 ) \
+-    SYSCALL_ENTRY( 0x00ac, NtLockFile, 40 ) \
+-    SYSCALL_ENTRY( 0x00ad, NtLockVirtualMemory, 16 ) \
+-    SYSCALL_ENTRY( 0x00ae, NtMakePermanentObject, 4 ) \
+-    SYSCALL_ENTRY( 0x00af, NtMakeTemporaryObject, 4 ) \
+-    SYSCALL_ENTRY( 0x00b0, NtMapViewOfSectionEx, 36 ) \
+-    SYSCALL_ENTRY( 0x00b1, NtNotifyChangeDirectoryFile, 36 ) \
+-    SYSCALL_ENTRY( 0x00b2, NtNotifyChangeKey, 40 ) \
+-    SYSCALL_ENTRY( 0x00b3, NtNotifyChangeMultipleKeys, 48 ) \
+-    SYSCALL_ENTRY( 0x00b4, NtOpenIoCompletion, 12 ) \
+-    SYSCALL_ENTRY( 0x00b5, NtOpenJobObject, 12 ) \
+-    SYSCALL_ENTRY( 0x00b6, NtOpenKeyEx, 16 ) \
+-    SYSCALL_ENTRY( 0x00b7, NtOpenKeyTransacted, 16 ) \
+-    SYSCALL_ENTRY( 0x00b8, NtOpenKeyTransactedEx, 20 ) \
+-    SYSCALL_ENTRY( 0x00b9, NtOpenKeyedEvent, 12 ) \
+-    SYSCALL_ENTRY( 0x00ba, NtOpenMutant, 12 ) \
+-    SYSCALL_ENTRY( 0x00bb, NtOpenProcessToken, 12 ) \
+-    SYSCALL_ENTRY( 0x00bc, NtOpenSemaphore, 12 ) \
+-    SYSCALL_ENTRY( 0x00bd, NtOpenSymbolicLinkObject, 12 ) \
+-    SYSCALL_ENTRY( 0x00be, NtOpenThread, 16 ) \
+-    SYSCALL_ENTRY( 0x00bf, NtOpenTimer, 12 ) \
+-    SYSCALL_ENTRY( 0x00c0, NtPrivilegeCheck, 12 ) \
+-    SYSCALL_ENTRY( 0x00c1, NtPulseEvent, 8 ) \
+-    SYSCALL_ENTRY( 0x00c2, NtQueryDirectoryObject, 28 ) \
+-    SYSCALL_ENTRY( 0x00c3, NtQueryEaFile, 36 ) \
+-    SYSCALL_ENTRY( 0x00c4, NtQueryFullAttributesFile, 8 ) \
+-    SYSCALL_ENTRY( 0x00c5, NtQueryInformationAtom, 20 ) \
+-    SYSCALL_ENTRY( 0x00c6, NtQueryInformationJobObject, 20 ) \
+-    SYSCALL_ENTRY( 0x00c7, NtQueryInstallUILanguage, 4 ) \
+-    SYSCALL_ENTRY( 0x00c8, NtQueryIoCompletion, 20 ) \
+-    SYSCALL_ENTRY( 0x00c9, NtQueryLicenseValue, 20 ) \
+-    SYSCALL_ENTRY( 0x00ca, NtQueryMultipleValueKey, 24 ) \
+-    SYSCALL_ENTRY( 0x00cb, NtQueryMutant, 20 ) \
+-    SYSCALL_ENTRY( 0x00cc, NtQuerySecurityObject, 20 ) \
+-    SYSCALL_ENTRY( 0x00cd, NtQuerySemaphore, 20 ) \
+-    SYSCALL_ENTRY( 0x00ce, NtQuerySymbolicLinkObject, 12 ) \
+-    SYSCALL_ENTRY( 0x00cf, NtQuerySystemEnvironmentValue, 16 ) \
+-    SYSCALL_ENTRY( 0x00d0, NtQuerySystemEnvironmentValueEx, 20 ) \
+-    SYSCALL_ENTRY( 0x00d1, NtQuerySystemInformationEx, 24 ) \
+-    SYSCALL_ENTRY( 0x00d2, NtQueryTimerResolution, 12 ) \
+-    SYSCALL_ENTRY( 0x00d3, NtQueueApcThreadEx, 24 ) \
+-    SYSCALL_ENTRY( 0x00d4, NtQueueApcThreadEx2, 28 ) \
+-    SYSCALL_ENTRY( 0x00d5, NtRaiseException, 12 ) \
+-    SYSCALL_ENTRY( 0x00d6, NtRaiseHardError, 24 ) \
+-    SYSCALL_ENTRY( 0x00d7, NtRegisterThreadTerminatePort, 4 ) \
+-    SYSCALL_ENTRY( 0x00d8, NtReleaseKeyedEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x00d9, NtRemoveIoCompletionEx, 24 ) \
+-    SYSCALL_ENTRY( 0x00da, NtRemoveProcessDebug, 8 ) \
+-    SYSCALL_ENTRY( 0x00db, NtRenameKey, 8 ) \
+-    SYSCALL_ENTRY( 0x00dc, NtReplaceKey, 12 ) \
+-    SYSCALL_ENTRY( 0x00dd, NtResetEvent, 8 ) \
+-    SYSCALL_ENTRY( 0x00de, NtResetWriteWatch, 12 ) \
+-    SYSCALL_ENTRY( 0x00df, NtRestoreKey, 12 ) \
+-    SYSCALL_ENTRY( 0x00e0, NtResumeProcess, 4 ) \
+-    SYSCALL_ENTRY( 0x00e1, NtRollbackTransaction, 8 ) \
+-    SYSCALL_ENTRY( 0x00e2, NtSaveKey, 8 ) \
+-    SYSCALL_ENTRY( 0x00e3, NtSecureConnectPort, 36 ) \
+-    SYSCALL_ENTRY( 0x00e4, NtSetContextThread, 8 ) \
+-    SYSCALL_ENTRY( 0x00e5, NtSetDebugFilterState, 12 ) \
+-    SYSCALL_ENTRY( 0x00e6, NtSetDefaultLocale, 8 ) \
+-    SYSCALL_ENTRY( 0x00e7, NtSetDefaultUILanguage, 4 ) \
+-    SYSCALL_ENTRY( 0x00e8, NtSetEaFile, 16 ) \
+-    SYSCALL_ENTRY( 0x00e9, NtSetInformationDebugObject, 20 ) \
+-    SYSCALL_ENTRY( 0x00ea, NtSetInformationJobObject, 16 ) \
+-    SYSCALL_ENTRY( 0x00eb, NtSetInformationKey, 16 ) \
+-    SYSCALL_ENTRY( 0x00ec, NtSetInformationToken, 16 ) \
+-    SYSCALL_ENTRY( 0x00ed, NtSetInformationVirtualMemory, 24 ) \
+-    SYSCALL_ENTRY( 0x00ee, NtSetIntervalProfile, 8 ) \
+-    SYSCALL_ENTRY( 0x00ef, NtSetIoCompletion, 20 ) \
+-    SYSCALL_ENTRY( 0x00f0, NtSetIoCompletionEx, 24 ) \
+-    SYSCALL_ENTRY( 0x00f1, NtSetLdtEntries, 24 ) \
+-    SYSCALL_ENTRY( 0x00f2, NtSetSecurityObject, 12 ) \
+-    SYSCALL_ENTRY( 0x00f3, NtSetSystemInformation, 12 ) \
+-    SYSCALL_ENTRY( 0x00f4, NtSetSystemTime, 8 ) \
+-    SYSCALL_ENTRY( 0x00f5, NtSetThreadExecutionState, 8 ) \
+-    SYSCALL_ENTRY( 0x00f6, NtSetTimerResolution, 12 ) \
+-    SYSCALL_ENTRY( 0x00f7, NtSetVolumeInformationFile, 20 ) \
+-    SYSCALL_ENTRY( 0x00f8, NtShutdownSystem, 4 ) \
+-    SYSCALL_ENTRY( 0x00f9, NtSignalAndWaitForSingleObject, 16 ) \
+-    SYSCALL_ENTRY( 0x00fa, NtSuspendProcess, 4 ) \
+-    SYSCALL_ENTRY( 0x00fb, NtSuspendThread, 8 ) \
+-    SYSCALL_ENTRY( 0x00fc, NtSystemDebugControl, 24 ) \
+-    SYSCALL_ENTRY( 0x00fd, NtTerminateJobObject, 8 ) \
+-    SYSCALL_ENTRY( 0x00fe, NtTestAlert, 0 ) \
+-    SYSCALL_ENTRY( 0x00ff, NtTraceControl, 24 ) \
+-    SYSCALL_ENTRY( 0x0100, NtUnloadDriver, 4 ) \
+-    SYSCALL_ENTRY( 0x0101, NtUnloadKey, 4 ) \
+-    SYSCALL_ENTRY( 0x0102, NtUnlockFile, 20 ) \
+-    SYSCALL_ENTRY( 0x0103, NtUnlockVirtualMemory, 16 ) \
+-    SYSCALL_ENTRY( 0x0104, NtUnmapViewOfSectionEx, 12 ) \
+-    SYSCALL_ENTRY( 0x0105, NtWaitForAlertByThreadId, 8 ) \
+-    SYSCALL_ENTRY( 0x0106, NtWaitForDebugEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x0107, NtWaitForKeyedEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x0108, NtWow64AllocateVirtualMemory64, 28 ) \
+-    SYSCALL_ENTRY( 0x0109, NtWow64GetNativeSystemInformation, 16 ) \
+-    SYSCALL_ENTRY( 0x010a, NtWow64IsProcessorFeaturePresent, 4 ) \
+-    SYSCALL_ENTRY( 0x010b, NtWow64QueryInformationProcess64, 20 ) \
+-    SYSCALL_ENTRY( 0x010c, NtWow64ReadVirtualMemory64, 28 ) \
+-    SYSCALL_ENTRY( 0x010d, NtWow64WriteVirtualMemory64, 28 )
++    SYSCALL_ENTRY( 0x00a7, NtImpersonateAnonymousToken, 4 ) \
++    SYSCALL_ENTRY( 0x00a8, NtInitializeNlsFiles, 12 ) \
++    SYSCALL_ENTRY( 0x00a9, NtInitiatePowerAction, 16 ) \
++    SYSCALL_ENTRY( 0x00aa, NtListenPort, 8 ) \
++    SYSCALL_ENTRY( 0x00ab, NtLoadDriver, 4 ) \
++    SYSCALL_ENTRY( 0x00ac, NtLoadKey, 8 ) \
++    SYSCALL_ENTRY( 0x00ad, NtLoadKey2, 12 ) \
++    SYSCALL_ENTRY( 0x00ae, NtLoadKeyEx, 32 ) \
++    SYSCALL_ENTRY( 0x00af, NtLockFile, 40 ) \
++    SYSCALL_ENTRY( 0x00b0, NtLockVirtualMemory, 16 ) \
++    SYSCALL_ENTRY( 0x00b1, NtMakePermanentObject, 4 ) \
++    SYSCALL_ENTRY( 0x00b2, NtMakeTemporaryObject, 4 ) \
++    SYSCALL_ENTRY( 0x00b3, NtMapViewOfSectionEx, 36 ) \
++    SYSCALL_ENTRY( 0x00b4, NtNotifyChangeDirectoryFile, 36 ) \
++    SYSCALL_ENTRY( 0x00b5, NtNotifyChangeKey, 40 ) \
++    SYSCALL_ENTRY( 0x00b6, NtNotifyChangeMultipleKeys, 48 ) \
++    SYSCALL_ENTRY( 0x00b7, NtOpenIoCompletion, 12 ) \
++    SYSCALL_ENTRY( 0x00b8, NtOpenJobObject, 12 ) \
++    SYSCALL_ENTRY( 0x00b9, NtOpenKeyEx, 16 ) \
++    SYSCALL_ENTRY( 0x00ba, NtOpenKeyTransacted, 16 ) \
++    SYSCALL_ENTRY( 0x00bb, NtOpenKeyTransactedEx, 20 ) \
++    SYSCALL_ENTRY( 0x00bc, NtOpenKeyedEvent, 12 ) \
++    SYSCALL_ENTRY( 0x00bd, NtOpenMutant, 12 ) \
++    SYSCALL_ENTRY( 0x00be, NtOpenProcessToken, 12 ) \
++    SYSCALL_ENTRY( 0x00bf, NtOpenSemaphore, 12 ) \
++    SYSCALL_ENTRY( 0x00c0, NtOpenSymbolicLinkObject, 12 ) \
++    SYSCALL_ENTRY( 0x00c1, NtOpenThread, 16 ) \
++    SYSCALL_ENTRY( 0x00c2, NtOpenTimer, 12 ) \
++    SYSCALL_ENTRY( 0x00c3, NtPrivilegeCheck, 12 ) \
++    SYSCALL_ENTRY( 0x00c4, NtPulseEvent, 8 ) \
++    SYSCALL_ENTRY( 0x00c5, NtQueryDirectoryObject, 28 ) \
++    SYSCALL_ENTRY( 0x00c6, NtQueryEaFile, 36 ) \
++    SYSCALL_ENTRY( 0x00c7, NtQueryFullAttributesFile, 8 ) \
++    SYSCALL_ENTRY( 0x00c8, NtQueryInformationAtom, 20 ) \
++    SYSCALL_ENTRY( 0x00c9, NtQueryInformationJobObject, 20 ) \
++    SYSCALL_ENTRY( 0x00ca, NtQueryInstallUILanguage, 4 ) \
++    SYSCALL_ENTRY( 0x00cb, NtQueryIoCompletion, 20 ) \
++    SYSCALL_ENTRY( 0x00cc, NtQueryLicenseValue, 20 ) \
++    SYSCALL_ENTRY( 0x00cd, NtQueryMultipleValueKey, 24 ) \
++    SYSCALL_ENTRY( 0x00ce, NtQueryMutant, 20 ) \
++    SYSCALL_ENTRY( 0x00cf, NtQuerySecurityObject, 20 ) \
++    SYSCALL_ENTRY( 0x00d0, NtQuerySemaphore, 20 ) \
++    SYSCALL_ENTRY( 0x00d1, NtQuerySymbolicLinkObject, 12 ) \
++    SYSCALL_ENTRY( 0x00d2, NtQuerySystemEnvironmentValue, 16 ) \
++    SYSCALL_ENTRY( 0x00d3, NtQuerySystemEnvironmentValueEx, 20 ) \
++    SYSCALL_ENTRY( 0x00d4, NtQuerySystemInformationEx, 24 ) \
++    SYSCALL_ENTRY( 0x00d5, NtQueryTimerResolution, 12 ) \
++    SYSCALL_ENTRY( 0x00d6, NtQueueApcThreadEx, 24 ) \
++    SYSCALL_ENTRY( 0x00d7, NtQueueApcThreadEx2, 28 ) \
++    SYSCALL_ENTRY( 0x00d8, NtRaiseException, 12 ) \
++    SYSCALL_ENTRY( 0x00d9, NtRaiseHardError, 24 ) \
++    SYSCALL_ENTRY( 0x00da, NtRegisterThreadTerminatePort, 4 ) \
++    SYSCALL_ENTRY( 0x00db, NtReleaseKeyedEvent, 16 ) \
++    SYSCALL_ENTRY( 0x00dc, NtRemoveIoCompletionEx, 24 ) \
++    SYSCALL_ENTRY( 0x00dd, NtRemoveProcessDebug, 8 ) \
++    SYSCALL_ENTRY( 0x00de, NtRenameKey, 8 ) \
++    SYSCALL_ENTRY( 0x00df, NtReplaceKey, 12 ) \
++    SYSCALL_ENTRY( 0x00e0, NtResetEvent, 8 ) \
++    SYSCALL_ENTRY( 0x00e1, NtResetWriteWatch, 12 ) \
++    SYSCALL_ENTRY( 0x00e2, NtRestoreKey, 12 ) \
++    SYSCALL_ENTRY( 0x00e3, NtResumeProcess, 4 ) \
++    SYSCALL_ENTRY( 0x00e4, NtRollbackTransaction, 8 ) \
++    SYSCALL_ENTRY( 0x00e5, NtSaveKey, 8 ) \
++    SYSCALL_ENTRY( 0x00e6, NtSecureConnectPort, 36 ) \
++    SYSCALL_ENTRY( 0x00e7, NtSetContextThread, 8 ) \
++    SYSCALL_ENTRY( 0x00e8, NtSetDebugFilterState, 12 ) \
++    SYSCALL_ENTRY( 0x00e9, NtSetDefaultLocale, 8 ) \
++    SYSCALL_ENTRY( 0x00ea, NtSetDefaultUILanguage, 4 ) \
++    SYSCALL_ENTRY( 0x00eb, NtSetEaFile, 16 ) \
++    SYSCALL_ENTRY( 0x00ec, NtSetInformationDebugObject, 20 ) \
++    SYSCALL_ENTRY( 0x00ed, NtSetInformationJobObject, 16 ) \
++    SYSCALL_ENTRY( 0x00ee, NtSetInformationKey, 16 ) \
++    SYSCALL_ENTRY( 0x00ef, NtSetInformationToken, 16 ) \
++    SYSCALL_ENTRY( 0x00f0, NtSetInformationVirtualMemory, 24 ) \
++    SYSCALL_ENTRY( 0x00f1, NtSetIntervalProfile, 8 ) \
++    SYSCALL_ENTRY( 0x00f2, NtSetIoCompletion, 20 ) \
++    SYSCALL_ENTRY( 0x00f3, NtSetIoCompletionEx, 24 ) \
++    SYSCALL_ENTRY( 0x00f4, NtSetLdtEntries, 24 ) \
++    SYSCALL_ENTRY( 0x00f5, NtSetSecurityObject, 12 ) \
++    SYSCALL_ENTRY( 0x00f6, NtSetSystemInformation, 12 ) \
++    SYSCALL_ENTRY( 0x00f7, NtSetSystemTime, 8 ) \
++    SYSCALL_ENTRY( 0x00f8, NtSetThreadExecutionState, 8 ) \
++    SYSCALL_ENTRY( 0x00f9, NtSetTimerResolution, 12 ) \
++    SYSCALL_ENTRY( 0x00fa, NtSetVolumeInformationFile, 20 ) \
++    SYSCALL_ENTRY( 0x00fb, NtShutdownSystem, 4 ) \
++    SYSCALL_ENTRY( 0x00fc, NtSignalAndWaitForSingleObject, 16 ) \
++    SYSCALL_ENTRY( 0x00fd, NtSuspendProcess, 4 ) \
++    SYSCALL_ENTRY( 0x00fe, NtSuspendThread, 8 ) \
++    SYSCALL_ENTRY( 0x00ff, NtSystemDebugControl, 24 ) \
++    SYSCALL_ENTRY( 0x0100, NtTerminateJobObject, 8 ) \
++    SYSCALL_ENTRY( 0x0101, NtTestAlert, 0 ) \
++    SYSCALL_ENTRY( 0x0102, NtTraceControl, 24 ) \
++    SYSCALL_ENTRY( 0x0103, NtUnloadDriver, 4 ) \
++    SYSCALL_ENTRY( 0x0104, NtUnloadKey, 4 ) \
++    SYSCALL_ENTRY( 0x0105, NtUnlockFile, 20 ) \
++    SYSCALL_ENTRY( 0x0106, NtUnlockVirtualMemory, 16 ) \
++    SYSCALL_ENTRY( 0x0107, NtUnmapViewOfSectionEx, 12 ) \
++    SYSCALL_ENTRY( 0x0108, NtWaitForAlertByThreadId, 8 ) \
++    SYSCALL_ENTRY( 0x0109, NtWaitForDebugEvent, 16 ) \
++    SYSCALL_ENTRY( 0x010a, NtWaitForKeyedEvent, 16 ) \
++    SYSCALL_ENTRY( 0x010b, NtWow64AllocateVirtualMemory64, 28 ) \
++    SYSCALL_ENTRY( 0x010c, NtWow64GetNativeSystemInformation, 16 ) \
++    SYSCALL_ENTRY( 0x010d, NtWow64IsProcessorFeaturePresent, 4 ) \
++    SYSCALL_ENTRY( 0x010e, NtWow64QueryInformationProcess64, 20 ) \
++    SYSCALL_ENTRY( 0x010f, NtWow64ReadVirtualMemory64, 28 ) \
++    SYSCALL_ENTRY( 0x0110, NtWow64WriteVirtualMemory64, 28 )
+ #ifdef _WIN64
+ #define ALL_SYSCALLS \
+     SYSCALL_ENTRY( 0x0000, NtAccessCheck, 64 ) \
+@@ -389,154 +392,157 @@
+     SYSCALL_ENTRY( 0x0071, NtAlpcSendWaitReceivePort, 64 ) \
+     SYSCALL_ENTRY( 0x0072, NtAreMappedFilesTheSame, 16 ) \
+     SYSCALL_ENTRY( 0x0073, NtAssignProcessToJobObject, 16 ) \
+-    SYSCALL_ENTRY( 0x0074, NtCancelIoFileEx, 24 ) \
+-    SYSCALL_ENTRY( 0x0075, NtCancelSynchronousIoFile, 24 ) \
+-    SYSCALL_ENTRY( 0x0076, NtCommitTransaction, 16 ) \
+-    SYSCALL_ENTRY( 0x0077, NtCompareObjects, 16 ) \
+-    SYSCALL_ENTRY( 0x0078, NtCompareTokens, 24 ) \
+-    SYSCALL_ENTRY( 0x0079, NtCompleteConnectPort, 8 ) \
+-    SYSCALL_ENTRY( 0x007a, NtConnectPort, 64 ) \
+-    SYSCALL_ENTRY( 0x007b, NtContinueEx, 16 ) \
+-    SYSCALL_ENTRY( 0x007c, NtConvertBetweenAuxiliaryCounterAndPerformanceCounter, 32 ) \
+-    SYSCALL_ENTRY( 0x007d, NtCreateDirectoryObject, 24 ) \
+-    SYSCALL_ENTRY( 0x007e, NtCreateIoCompletion, 32 ) \
+-    SYSCALL_ENTRY( 0x007f, NtCreateJobObject, 24 ) \
+-    SYSCALL_ENTRY( 0x0080, NtCreateKeyTransacted, 64 ) \
+-    SYSCALL_ENTRY( 0x0081, NtCreateKeyedEvent, 32 ) \
+-    SYSCALL_ENTRY( 0x0082, NtCreateLowBoxToken, 72 ) \
+-    SYSCALL_ENTRY( 0x0083, NtCreateMailslotFile, 64 ) \
+-    SYSCALL_ENTRY( 0x0084, NtCreateMutant, 32 ) \
+-    SYSCALL_ENTRY( 0x0085, NtCreateNamedPipeFile, 112 ) \
+-    SYSCALL_ENTRY( 0x0086, NtCreatePagingFile, 32 ) \
+-    SYSCALL_ENTRY( 0x0087, NtCreatePort, 40 ) \
+-    SYSCALL_ENTRY( 0x0088, NtCreateSectionEx, 72 ) \
+-    SYSCALL_ENTRY( 0x0089, NtCreateSemaphore, 40 ) \
+-    SYSCALL_ENTRY( 0x008a, NtCreateSymbolicLinkObject, 32 ) \
+-    SYSCALL_ENTRY( 0x008b, NtCreateThreadEx, 88 ) \
+-    SYSCALL_ENTRY( 0x008c, NtCreateTimer, 32 ) \
+-    SYSCALL_ENTRY( 0x008d, NtCreateToken, 104 ) \
+-    SYSCALL_ENTRY( 0x008e, NtCreateTransaction, 80 ) \
+-    SYSCALL_ENTRY( 0x008f, NtCreateUserProcess, 88 ) \
+-    SYSCALL_ENTRY( 0x0090, NtDebugActiveProcess, 16 ) \
+-    SYSCALL_ENTRY( 0x0091, NtDebugContinue, 24 ) \
+-    SYSCALL_ENTRY( 0x0092, NtDeleteAtom, 8 ) \
+-    SYSCALL_ENTRY( 0x0093, NtDeleteFile, 8 ) \
+-    SYSCALL_ENTRY( 0x0094, NtDeleteKey, 8 ) \
+-    SYSCALL_ENTRY( 0x0095, NtDeleteValueKey, 16 ) \
+-    SYSCALL_ENTRY( 0x0096, NtDisplayString, 8 ) \
+-    SYSCALL_ENTRY( 0x0097, NtFilterToken, 48 ) \
+-    SYSCALL_ENTRY( 0x0098, NtFlushBuffersFileEx, 40 ) \
+-    SYSCALL_ENTRY( 0x0099, NtFlushInstructionCache, 24 ) \
+-    SYSCALL_ENTRY( 0x009a, NtFlushKey, 8 ) \
+-    SYSCALL_ENTRY( 0x009b, NtFlushProcessWriteBuffers, 0 ) \
+-    SYSCALL_ENTRY( 0x009c, NtFlushVirtualMemory, 32 ) \
+-    SYSCALL_ENTRY( 0x009d, NtGetContextThread, 16 ) \
+-    SYSCALL_ENTRY( 0x009e, NtGetCurrentProcessorNumber, 0 ) \
+-    SYSCALL_ENTRY( 0x009f, NtGetNextProcess, 40 ) \
+-    SYSCALL_ENTRY( 0x00a0, NtGetNextThread, 48 ) \
+-    SYSCALL_ENTRY( 0x00a1, NtGetNlsSectionPtr, 40 ) \
+-    SYSCALL_ENTRY( 0x00a2, NtGetWriteWatch, 56 ) \
+-    SYSCALL_ENTRY( 0x00a3, NtImpersonateAnonymousToken, 8 ) \
+-    SYSCALL_ENTRY( 0x00a4, NtInitializeNlsFiles, 24 ) \
+-    SYSCALL_ENTRY( 0x00a5, NtInitiatePowerAction, 32 ) \
++    SYSCALL_ENTRY( 0x0074, NtAssociateWaitCompletionPacket, 64 ) \
++    SYSCALL_ENTRY( 0x0075, NtCancelIoFileEx, 24 ) \
++    SYSCALL_ENTRY( 0x0076, NtCancelSynchronousIoFile, 24 ) \
++    SYSCALL_ENTRY( 0x0077, NtCancelWaitCompletionPacket, 16 ) \
++    SYSCALL_ENTRY( 0x0078, NtCommitTransaction, 16 ) \
++    SYSCALL_ENTRY( 0x0079, NtCompareObjects, 16 ) \
++    SYSCALL_ENTRY( 0x007a, NtCompareTokens, 24 ) \
++    SYSCALL_ENTRY( 0x007b, NtCompleteConnectPort, 8 ) \
++    SYSCALL_ENTRY( 0x007c, NtConnectPort, 64 ) \
++    SYSCALL_ENTRY( 0x007d, NtContinueEx, 16 ) \
++    SYSCALL_ENTRY( 0x007e, NtConvertBetweenAuxiliaryCounterAndPerformanceCounter, 32 ) \
++    SYSCALL_ENTRY( 0x007f, NtCreateDirectoryObject, 24 ) \
++    SYSCALL_ENTRY( 0x0080, NtCreateIoCompletion, 32 ) \
++    SYSCALL_ENTRY( 0x0081, NtCreateJobObject, 24 ) \
++    SYSCALL_ENTRY( 0x0082, NtCreateKeyTransacted, 64 ) \
++    SYSCALL_ENTRY( 0x0083, NtCreateKeyedEvent, 32 ) \
++    SYSCALL_ENTRY( 0x0084, NtCreateLowBoxToken, 72 ) \
++    SYSCALL_ENTRY( 0x0085, NtCreateMailslotFile, 64 ) \
++    SYSCALL_ENTRY( 0x0086, NtCreateMutant, 32 ) \
++    SYSCALL_ENTRY( 0x0087, NtCreateNamedPipeFile, 112 ) \
++    SYSCALL_ENTRY( 0x0088, NtCreatePagingFile, 32 ) \
++    SYSCALL_ENTRY( 0x0089, NtCreatePort, 40 ) \
++    SYSCALL_ENTRY( 0x008a, NtCreateSectionEx, 72 ) \
++    SYSCALL_ENTRY( 0x008b, NtCreateSemaphore, 40 ) \
++    SYSCALL_ENTRY( 0x008c, NtCreateSymbolicLinkObject, 32 ) \
++    SYSCALL_ENTRY( 0x008d, NtCreateThreadEx, 88 ) \
++    SYSCALL_ENTRY( 0x008e, NtCreateTimer, 32 ) \
++    SYSCALL_ENTRY( 0x008f, NtCreateToken, 104 ) \
++    SYSCALL_ENTRY( 0x0090, NtCreateTransaction, 80 ) \
++    SYSCALL_ENTRY( 0x0091, NtCreateUserProcess, 88 ) \
++    SYSCALL_ENTRY( 0x0092, NtCreateWaitCompletionPacket, 24 ) \
++    SYSCALL_ENTRY( 0x0093, NtDebugActiveProcess, 16 ) \
++    SYSCALL_ENTRY( 0x0094, NtDebugContinue, 24 ) \
++    SYSCALL_ENTRY( 0x0095, NtDeleteAtom, 8 ) \
++    SYSCALL_ENTRY( 0x0096, NtDeleteFile, 8 ) \
++    SYSCALL_ENTRY( 0x0097, NtDeleteKey, 8 ) \
++    SYSCALL_ENTRY( 0x0098, NtDeleteValueKey, 16 ) \
++    SYSCALL_ENTRY( 0x0099, NtDisplayString, 8 ) \
++    SYSCALL_ENTRY( 0x009a, NtFilterToken, 48 ) \
++    SYSCALL_ENTRY( 0x009b, NtFlushBuffersFileEx, 40 ) \
++    SYSCALL_ENTRY( 0x009c, NtFlushInstructionCache, 24 ) \
++    SYSCALL_ENTRY( 0x009d, NtFlushKey, 8 ) \
++    SYSCALL_ENTRY( 0x009e, NtFlushProcessWriteBuffers, 0 ) \
++    SYSCALL_ENTRY( 0x009f, NtFlushVirtualMemory, 32 ) \
++    SYSCALL_ENTRY( 0x00a0, NtGetContextThread, 16 ) \
++    SYSCALL_ENTRY( 0x00a1, NtGetCurrentProcessorNumber, 0 ) \
++    SYSCALL_ENTRY( 0x00a2, NtGetNextProcess, 40 ) \
++    SYSCALL_ENTRY( 0x00a3, NtGetNextThread, 48 ) \
++    SYSCALL_ENTRY( 0x00a4, NtGetNlsSectionPtr, 40 ) \
++    SYSCALL_ENTRY( 0x00a5, NtGetWriteWatch, 56 ) \
+     SYSCALL_ENTRY( 0x00a6, NtCreateDebugObject, 32 ) \
+-    SYSCALL_ENTRY( 0x00a7, NtListenPort, 16 ) \
+-    SYSCALL_ENTRY( 0x00a8, NtLoadDriver, 8 ) \
+-    SYSCALL_ENTRY( 0x00a9, NtLoadKey, 16 ) \
+-    SYSCALL_ENTRY( 0x00aa, NtLoadKey2, 24 ) \
+-    SYSCALL_ENTRY( 0x00ab, NtLoadKeyEx, 64 ) \
+-    SYSCALL_ENTRY( 0x00ac, NtLockFile, 80 ) \
+-    SYSCALL_ENTRY( 0x00ad, NtLockVirtualMemory, 32 ) \
+-    SYSCALL_ENTRY( 0x00ae, NtMakePermanentObject, 8 ) \
+-    SYSCALL_ENTRY( 0x00af, NtMakeTemporaryObject, 8 ) \
+-    SYSCALL_ENTRY( 0x00b0, NtMapViewOfSectionEx, 72 ) \
+-    SYSCALL_ENTRY( 0x00b1, NtNotifyChangeDirectoryFile, 72 ) \
+-    SYSCALL_ENTRY( 0x00b2, NtNotifyChangeKey, 80 ) \
+-    SYSCALL_ENTRY( 0x00b3, NtNotifyChangeMultipleKeys, 96 ) \
+-    SYSCALL_ENTRY( 0x00b4, NtOpenIoCompletion, 24 ) \
+-    SYSCALL_ENTRY( 0x00b5, NtOpenJobObject, 24 ) \
+-    SYSCALL_ENTRY( 0x00b6, NtOpenKeyEx, 32 ) \
+-    SYSCALL_ENTRY( 0x00b7, NtOpenKeyTransacted, 32 ) \
+-    SYSCALL_ENTRY( 0x00b8, NtOpenKeyTransactedEx, 40 ) \
+-    SYSCALL_ENTRY( 0x00b9, NtOpenKeyedEvent, 24 ) \
+-    SYSCALL_ENTRY( 0x00ba, NtOpenMutant, 24 ) \
+-    SYSCALL_ENTRY( 0x00bb, NtOpenProcessToken, 24 ) \
+-    SYSCALL_ENTRY( 0x00bc, NtOpenSemaphore, 24 ) \
+-    SYSCALL_ENTRY( 0x00bd, NtOpenSymbolicLinkObject, 24 ) \
+-    SYSCALL_ENTRY( 0x00be, NtOpenThread, 32 ) \
+-    SYSCALL_ENTRY( 0x00bf, NtOpenTimer, 24 ) \
+-    SYSCALL_ENTRY( 0x00c0, NtPrivilegeCheck, 24 ) \
+-    SYSCALL_ENTRY( 0x00c1, NtPulseEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x00c2, NtQueryDirectoryObject, 56 ) \
+-    SYSCALL_ENTRY( 0x00c3, NtQueryEaFile, 72 ) \
+-    SYSCALL_ENTRY( 0x00c4, NtQueryFullAttributesFile, 16 ) \
+-    SYSCALL_ENTRY( 0x00c5, NtQueryInformationAtom, 40 ) \
+-    SYSCALL_ENTRY( 0x00c6, NtQueryInformationJobObject, 40 ) \
+-    SYSCALL_ENTRY( 0x00c7, NtQueryInstallUILanguage, 8 ) \
+-    SYSCALL_ENTRY( 0x00c8, NtQueryIoCompletion, 40 ) \
+-    SYSCALL_ENTRY( 0x00c9, NtQueryLicenseValue, 40 ) \
+-    SYSCALL_ENTRY( 0x00ca, NtQueryMultipleValueKey, 48 ) \
+-    SYSCALL_ENTRY( 0x00cb, NtQueryMutant, 40 ) \
+-    SYSCALL_ENTRY( 0x00cc, NtQuerySecurityObject, 40 ) \
+-    SYSCALL_ENTRY( 0x00cd, NtQuerySemaphore, 40 ) \
+-    SYSCALL_ENTRY( 0x00ce, NtQuerySymbolicLinkObject, 24 ) \
+-    SYSCALL_ENTRY( 0x00cf, NtQuerySystemEnvironmentValue, 32 ) \
+-    SYSCALL_ENTRY( 0x00d0, NtQuerySystemEnvironmentValueEx, 40 ) \
+-    SYSCALL_ENTRY( 0x00d1, NtQuerySystemInformationEx, 48 ) \
+-    SYSCALL_ENTRY( 0x00d2, NtQueryTimerResolution, 24 ) \
+-    SYSCALL_ENTRY( 0x00d3, NtQueueApcThreadEx, 48 ) \
+-    SYSCALL_ENTRY( 0x00d4, NtQueueApcThreadEx2, 56 ) \
+-    SYSCALL_ENTRY( 0x00d5, NtRaiseException, 24 ) \
+-    SYSCALL_ENTRY( 0x00d6, NtRaiseHardError, 48 ) \
+-    SYSCALL_ENTRY( 0x00d7, NtRegisterThreadTerminatePort, 8 ) \
+-    SYSCALL_ENTRY( 0x00d8, NtReleaseKeyedEvent, 32 ) \
+-    SYSCALL_ENTRY( 0x00d9, NtRemoveIoCompletionEx, 48 ) \
+-    SYSCALL_ENTRY( 0x00da, NtRemoveProcessDebug, 16 ) \
+-    SYSCALL_ENTRY( 0x00db, NtRenameKey, 16 ) \
+-    SYSCALL_ENTRY( 0x00dc, NtReplaceKey, 24 ) \
+-    SYSCALL_ENTRY( 0x00dd, NtResetEvent, 16 ) \
+-    SYSCALL_ENTRY( 0x00de, NtResetWriteWatch, 24 ) \
+-    SYSCALL_ENTRY( 0x00df, NtRestoreKey, 24 ) \
+-    SYSCALL_ENTRY( 0x00e0, NtResumeProcess, 8 ) \
+-    SYSCALL_ENTRY( 0x00e1, NtRollbackTransaction, 16 ) \
+-    SYSCALL_ENTRY( 0x00e2, NtSaveKey, 16 ) \
+-    SYSCALL_ENTRY( 0x00e3, NtSecureConnectPort, 72 ) \
+-    SYSCALL_ENTRY( 0x00e4, NtSetContextThread, 16 ) \
+-    SYSCALL_ENTRY( 0x00e5, NtSetDebugFilterState, 24 ) \
+-    SYSCALL_ENTRY( 0x00e6, NtSetDefaultLocale, 16 ) \
+-    SYSCALL_ENTRY( 0x00e7, NtSetDefaultUILanguage, 8 ) \
+-    SYSCALL_ENTRY( 0x00e8, NtSetEaFile, 32 ) \
+-    SYSCALL_ENTRY( 0x00e9, NtSetInformationDebugObject, 40 ) \
+-    SYSCALL_ENTRY( 0x00ea, NtSetInformationJobObject, 32 ) \
+-    SYSCALL_ENTRY( 0x00eb, NtSetInformationKey, 32 ) \
+-    SYSCALL_ENTRY( 0x00ec, NtSetInformationToken, 32 ) \
+-    SYSCALL_ENTRY( 0x00ed, NtSetInformationVirtualMemory, 48 ) \
+-    SYSCALL_ENTRY( 0x00ee, NtSetIntervalProfile, 16 ) \
+-    SYSCALL_ENTRY( 0x00ef, NtSetIoCompletion, 40 ) \
+-    SYSCALL_ENTRY( 0x00f0, NtSetIoCompletionEx, 48 ) \
+-    SYSCALL_ENTRY( 0x00f1, NtSetLdtEntries, 48 ) \
+-    SYSCALL_ENTRY( 0x00f2, NtSetSecurityObject, 24 ) \
+-    SYSCALL_ENTRY( 0x00f3, NtSetSystemInformation, 24 ) \
+-    SYSCALL_ENTRY( 0x00f4, NtSetSystemTime, 16 ) \
+-    SYSCALL_ENTRY( 0x00f5, NtSetThreadExecutionState, 16 ) \
+-    SYSCALL_ENTRY( 0x00f6, NtSetTimerResolution, 24 ) \
+-    SYSCALL_ENTRY( 0x00f7, NtSetVolumeInformationFile, 40 ) \
+-    SYSCALL_ENTRY( 0x00f8, NtShutdownSystem, 8 ) \
+-    SYSCALL_ENTRY( 0x00f9, NtSignalAndWaitForSingleObject, 32 ) \
+-    SYSCALL_ENTRY( 0x00fa, NtSuspendProcess, 8 ) \
+-    SYSCALL_ENTRY( 0x00fb, NtSuspendThread, 16 ) \
+-    SYSCALL_ENTRY( 0x00fc, NtSystemDebugControl, 48 ) \
+-    SYSCALL_ENTRY( 0x00fd, NtTerminateJobObject, 16 ) \
+-    SYSCALL_ENTRY( 0x00fe, NtTestAlert, 0 ) \
+-    SYSCALL_ENTRY( 0x00ff, NtTraceControl, 48 ) \
+-    SYSCALL_ENTRY( 0x0100, NtUnloadDriver, 8 ) \
+-    SYSCALL_ENTRY( 0x0101, NtUnloadKey, 8 ) \
+-    SYSCALL_ENTRY( 0x0102, NtUnlockFile, 40 ) \
+-    SYSCALL_ENTRY( 0x0103, NtUnlockVirtualMemory, 32 ) \
+-    SYSCALL_ENTRY( 0x0104, NtUnmapViewOfSectionEx, 24 ) \
+-    SYSCALL_ENTRY( 0x0105, NtWaitForAlertByThreadId, 16 ) \
+-    SYSCALL_ENTRY( 0x0106, NtWaitForDebugEvent, 32 ) \
+-    SYSCALL_ENTRY( 0x0107, NtWaitForKeyedEvent, 32 )
++    SYSCALL_ENTRY( 0x00a7, NtImpersonateAnonymousToken, 8 ) \
++    SYSCALL_ENTRY( 0x00a8, NtInitializeNlsFiles, 24 ) \
++    SYSCALL_ENTRY( 0x00a9, NtInitiatePowerAction, 32 ) \
++    SYSCALL_ENTRY( 0x00aa, NtListenPort, 16 ) \
++    SYSCALL_ENTRY( 0x00ab, NtLoadDriver, 8 ) \
++    SYSCALL_ENTRY( 0x00ac, NtLoadKey, 16 ) \
++    SYSCALL_ENTRY( 0x00ad, NtLoadKey2, 24 ) \
++    SYSCALL_ENTRY( 0x00ae, NtLoadKeyEx, 64 ) \
++    SYSCALL_ENTRY( 0x00af, NtLockFile, 80 ) \
++    SYSCALL_ENTRY( 0x00b0, NtLockVirtualMemory, 32 ) \
++    SYSCALL_ENTRY( 0x00b1, NtMakePermanentObject, 8 ) \
++    SYSCALL_ENTRY( 0x00b2, NtMakeTemporaryObject, 8 ) \
++    SYSCALL_ENTRY( 0x00b3, NtMapViewOfSectionEx, 72 ) \
++    SYSCALL_ENTRY( 0x00b4, NtNotifyChangeDirectoryFile, 72 ) \
++    SYSCALL_ENTRY( 0x00b5, NtNotifyChangeKey, 80 ) \
++    SYSCALL_ENTRY( 0x00b6, NtNotifyChangeMultipleKeys, 96 ) \
++    SYSCALL_ENTRY( 0x00b7, NtOpenIoCompletion, 24 ) \
++    SYSCALL_ENTRY( 0x00b8, NtOpenJobObject, 24 ) \
++    SYSCALL_ENTRY( 0x00b9, NtOpenKeyEx, 32 ) \
++    SYSCALL_ENTRY( 0x00ba, NtOpenKeyTransacted, 32 ) \
++    SYSCALL_ENTRY( 0x00bb, NtOpenKeyTransactedEx, 40 ) \
++    SYSCALL_ENTRY( 0x00bc, NtOpenKeyedEvent, 24 ) \
++    SYSCALL_ENTRY( 0x00bd, NtOpenMutant, 24 ) \
++    SYSCALL_ENTRY( 0x00be, NtOpenProcessToken, 24 ) \
++    SYSCALL_ENTRY( 0x00bf, NtOpenSemaphore, 24 ) \
++    SYSCALL_ENTRY( 0x00c0, NtOpenSymbolicLinkObject, 24 ) \
++    SYSCALL_ENTRY( 0x00c1, NtOpenThread, 32 ) \
++    SYSCALL_ENTRY( 0x00c2, NtOpenTimer, 24 ) \
++    SYSCALL_ENTRY( 0x00c3, NtPrivilegeCheck, 24 ) \
++    SYSCALL_ENTRY( 0x00c4, NtPulseEvent, 16 ) \
++    SYSCALL_ENTRY( 0x00c5, NtQueryDirectoryObject, 56 ) \
++    SYSCALL_ENTRY( 0x00c6, NtQueryEaFile, 72 ) \
++    SYSCALL_ENTRY( 0x00c7, NtQueryFullAttributesFile, 16 ) \
++    SYSCALL_ENTRY( 0x00c8, NtQueryInformationAtom, 40 ) \
++    SYSCALL_ENTRY( 0x00c9, NtQueryInformationJobObject, 40 ) \
++    SYSCALL_ENTRY( 0x00ca, NtQueryInstallUILanguage, 8 ) \
++    SYSCALL_ENTRY( 0x00cb, NtQueryIoCompletion, 40 ) \
++    SYSCALL_ENTRY( 0x00cc, NtQueryLicenseValue, 40 ) \
++    SYSCALL_ENTRY( 0x00cd, NtQueryMultipleValueKey, 48 ) \
++    SYSCALL_ENTRY( 0x00ce, NtQueryMutant, 40 ) \
++    SYSCALL_ENTRY( 0x00cf, NtQuerySecurityObject, 40 ) \
++    SYSCALL_ENTRY( 0x00d0, NtQuerySemaphore, 40 ) \
++    SYSCALL_ENTRY( 0x00d1, NtQuerySymbolicLinkObject, 24 ) \
++    SYSCALL_ENTRY( 0x00d2, NtQuerySystemEnvironmentValue, 32 ) \
++    SYSCALL_ENTRY( 0x00d3, NtQuerySystemEnvironmentValueEx, 40 ) \
++    SYSCALL_ENTRY( 0x00d4, NtQuerySystemInformationEx, 48 ) \
++    SYSCALL_ENTRY( 0x00d5, NtQueryTimerResolution, 24 ) \
++    SYSCALL_ENTRY( 0x00d6, NtQueueApcThreadEx, 48 ) \
++    SYSCALL_ENTRY( 0x00d7, NtQueueApcThreadEx2, 56 ) \
++    SYSCALL_ENTRY( 0x00d8, NtRaiseException, 24 ) \
++    SYSCALL_ENTRY( 0x00d9, NtRaiseHardError, 48 ) \
++    SYSCALL_ENTRY( 0x00da, NtRegisterThreadTerminatePort, 8 ) \
++    SYSCALL_ENTRY( 0x00db, NtReleaseKeyedEvent, 32 ) \
++    SYSCALL_ENTRY( 0x00dc, NtRemoveIoCompletionEx, 48 ) \
++    SYSCALL_ENTRY( 0x00dd, NtRemoveProcessDebug, 16 ) \
++    SYSCALL_ENTRY( 0x00de, NtRenameKey, 16 ) \
++    SYSCALL_ENTRY( 0x00df, NtReplaceKey, 24 ) \
++    SYSCALL_ENTRY( 0x00e0, NtResetEvent, 16 ) \
++    SYSCALL_ENTRY( 0x00e1, NtResetWriteWatch, 24 ) \
++    SYSCALL_ENTRY( 0x00e2, NtRestoreKey, 24 ) \
++    SYSCALL_ENTRY( 0x00e3, NtResumeProcess, 8 ) \
++    SYSCALL_ENTRY( 0x00e4, NtRollbackTransaction, 16 ) \
++    SYSCALL_ENTRY( 0x00e5, NtSaveKey, 16 ) \
++    SYSCALL_ENTRY( 0x00e6, NtSecureConnectPort, 72 ) \
++    SYSCALL_ENTRY( 0x00e7, NtSetContextThread, 16 ) \
++    SYSCALL_ENTRY( 0x00e8, NtSetDebugFilterState, 24 ) \
++    SYSCALL_ENTRY( 0x00e9, NtSetDefaultLocale, 16 ) \
++    SYSCALL_ENTRY( 0x00ea, NtSetDefaultUILanguage, 8 ) \
++    SYSCALL_ENTRY( 0x00eb, NtSetEaFile, 32 ) \
++    SYSCALL_ENTRY( 0x00ec, NtSetInformationDebugObject, 40 ) \
++    SYSCALL_ENTRY( 0x00ed, NtSetInformationJobObject, 32 ) \
++    SYSCALL_ENTRY( 0x00ee, NtSetInformationKey, 32 ) \
++    SYSCALL_ENTRY( 0x00ef, NtSetInformationToken, 32 ) \
++    SYSCALL_ENTRY( 0x00f0, NtSetInformationVirtualMemory, 48 ) \
++    SYSCALL_ENTRY( 0x00f1, NtSetIntervalProfile, 16 ) \
++    SYSCALL_ENTRY( 0x00f2, NtSetIoCompletion, 40 ) \
++    SYSCALL_ENTRY( 0x00f3, NtSetIoCompletionEx, 48 ) \
++    SYSCALL_ENTRY( 0x00f4, NtSetLdtEntries, 48 ) \
++    SYSCALL_ENTRY( 0x00f5, NtSetSecurityObject, 24 ) \
++    SYSCALL_ENTRY( 0x00f6, NtSetSystemInformation, 24 ) \
++    SYSCALL_ENTRY( 0x00f7, NtSetSystemTime, 16 ) \
++    SYSCALL_ENTRY( 0x00f8, NtSetThreadExecutionState, 16 ) \
++    SYSCALL_ENTRY( 0x00f9, NtSetTimerResolution, 24 ) \
++    SYSCALL_ENTRY( 0x00fa, NtSetVolumeInformationFile, 40 ) \
++    SYSCALL_ENTRY( 0x00fb, NtShutdownSystem, 8 ) \
++    SYSCALL_ENTRY( 0x00fc, NtSignalAndWaitForSingleObject, 32 ) \
++    SYSCALL_ENTRY( 0x00fd, NtSuspendProcess, 8 ) \
++    SYSCALL_ENTRY( 0x00fe, NtSuspendThread, 16 ) \
++    SYSCALL_ENTRY( 0x00ff, NtSystemDebugControl, 48 ) \
++    SYSCALL_ENTRY( 0x0100, NtTerminateJobObject, 16 ) \
++    SYSCALL_ENTRY( 0x0101, NtTestAlert, 0 ) \
++    SYSCALL_ENTRY( 0x0102, NtTraceControl, 48 ) \
++    SYSCALL_ENTRY( 0x0103, NtUnloadDriver, 8 ) \
++    SYSCALL_ENTRY( 0x0104, NtUnloadKey, 8 ) \
++    SYSCALL_ENTRY( 0x0105, NtUnlockFile, 40 ) \
++    SYSCALL_ENTRY( 0x0106, NtUnlockVirtualMemory, 32 ) \
++    SYSCALL_ENTRY( 0x0107, NtUnmapViewOfSectionEx, 24 ) \
++    SYSCALL_ENTRY( 0x0108, NtWaitForAlertByThreadId, 16 ) \
++    SYSCALL_ENTRY( 0x0109, NtWaitForDebugEvent, 32 ) \
++    SYSCALL_ENTRY( 0x010a, NtWaitForKeyedEvent, 32 )
+ #else
+ #define ALL_SYSCALLS ALL_SYSCALLS32
+ #endif
+diff --git a/dlls/ntdll/unix/alpc.c b/dlls/ntdll/unix/alpc.c
+index 84a11ec..fe42b5e 100644
+--- a/dlls/ntdll/unix/alpc.c
++++ b/dlls/ntdll/unix/alpc.c
+@@ -330,6 +330,12 @@ NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, DWORD flags,
+ 
+     if (!ret && recv_buffer_size) *recv_buffer_size = io.Information;
+ 
++    /* Report that the received message carried no out-of-band attributes, so
++     * the caller's AlpcGetMessageAttribute() calls return NULL cleanly instead
++     * of dereferencing an uninitialised attribute block. */
++    if (!ret && recv_msg_attr)
++        recv_msg_attr->ValidAttributes = 0;
++
+     /* Detect the wine-internal connect notification blob and turn it into a
+      * proper PORT_MESSAGE in-place. */
+     if (!ret && recv_msg && io.Information == 2 * sizeof(ULONG))
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index fbf054e..9b6beea 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2969,6 +2969,88 @@ NTSTATUS WINAPI NtQueryIoCompletion( HANDLE handle, IO_COMPLETION_INFORMATION_CL
+ }
+ 
+ 
++/***********************************************************************
++ *             NtCreateWaitCompletionPacket (NTDLL.@)
++ */
++NTSTATUS WINAPI NtCreateWaitCompletionPacket( HANDLE *handle, ACCESS_MASK access,
++                                              OBJECT_ATTRIBUTES *attr )
++{
++    unsigned int status;
++    data_size_t len;
++    struct object_attributes *objattr;
++
++    TRACE( "(%p, %x, %p)\n", handle, (int)access, attr );
++
++    if (!handle) return STATUS_ACCESS_VIOLATION;
++    *handle = 0;
++    if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
++
++    SERVER_START_REQ( create_wait_completion_packet )
++    {
++        req->access = access;
++        wine_server_add_data( req, objattr, len );
++        if (!(status = wine_server_call( req )))
++            *handle = wine_server_ptr_handle( reply->handle );
++    }
++    SERVER_END_REQ;
++
++    free( objattr );
++    return status;
++}
++
++
++/***********************************************************************
++ *             NtAssociateWaitCompletionPacket (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAssociateWaitCompletionPacket( HANDLE handle, HANDLE completion_handle,
++                                                 HANDLE target_handle, void *key_context,
++                                                 void *apc_context, NTSTATUS io_status,
++                                                 ULONG_PTR io_status_info, BOOLEAN *already_signaled )
++{
++    unsigned int status;
++
++    TRACE( "(%p, %p, %p, %p, %p, %x, %lx, %p)\n", handle, completion_handle, target_handle,
++           key_context, apc_context, (int)io_status, (unsigned long)io_status_info, already_signaled );
++
++    SERVER_START_REQ( associate_wait_completion_packet )
++    {
++        req->handle      = wine_server_obj_handle( handle );
++        req->completion  = wine_server_obj_handle( completion_handle );
++        req->target      = wine_server_obj_handle( target_handle );
++        req->status      = io_status;
++        req->key         = (apc_param_t)(ULONG_PTR)key_context;
++        req->apc         = (apc_param_t)(ULONG_PTR)apc_context;
++        req->information = io_status_info;
++        if (!(status = wine_server_call( req )) && already_signaled)
++            *already_signaled = reply->signaled;
++    }
++    SERVER_END_REQ;
++
++    return status;
++}
++
++
++/***********************************************************************
++ *             NtCancelWaitCompletionPacket (NTDLL.@)
++ */
++NTSTATUS WINAPI NtCancelWaitCompletionPacket( HANDLE handle, BOOLEAN remove_signaled_packet )
++{
++    unsigned int status;
++
++    TRACE( "(%p, %d)\n", handle, remove_signaled_packet );
++
++    SERVER_START_REQ( cancel_wait_completion_packet )
++    {
++        req->handle          = wine_server_obj_handle( handle );
++        req->remove_signaled = remove_signaled_packet;
++        status = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++
++    return status;
++}
++
++
+ /***********************************************************************
+  *             NtCreateSection (NTDLL.@)
+  */
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 7b8c832..a327263 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6194,6 +6194,7 @@ struct d3dkmt_mutex_release_reply
+ };
+ 
+ 
++
+ struct create_alpc_port_request
+ {
+     struct request_header __header;
+@@ -6253,6 +6254,56 @@ struct disconnect_alpc_port_reply
+ };
+ 
+ 
++
++struct create_wait_completion_packet_request
++{
++    struct request_header __header;
++    unsigned int        access;
++    /* VARARG(objattr,object_attributes); */
++};
++struct create_wait_completion_packet_reply
++{
++    struct reply_header __header;
++    obj_handle_t        handle;
++    char __pad_12[4];
++};
++
++
++struct associate_wait_completion_packet_request
++{
++    struct request_header __header;
++    obj_handle_t        handle;
++    obj_handle_t        completion;
++    obj_handle_t        target;
++    unsigned int        status;
++    char __pad_28[4];
++    apc_param_t         key;
++    apc_param_t         apc;
++    apc_param_t         information;
++};
++struct associate_wait_completion_packet_reply
++{
++    struct reply_header __header;
++    int                 signaled;
++    char __pad_12[4];
++};
++
++
++struct cancel_wait_completion_packet_request
++{
++    struct request_header __header;
++    obj_handle_t        handle;
++    int                 remove_signaled;
++    char __pad_20[4];
++};
++struct cancel_wait_completion_packet_reply
++{
++    struct reply_header __header;
++    int                 cancelled;
++    char __pad_12[4];
++};
++
++
+ enum request
+ {
+     REQ_new_process,
+@@ -6566,6 +6617,9 @@ enum request
+     REQ_connect_alpc_port,
+     REQ_accept_alpc_connection,
+     REQ_disconnect_alpc_port,
++    REQ_create_wait_completion_packet,
++    REQ_associate_wait_completion_packet,
++    REQ_cancel_wait_completion_packet,
+     REQ_NB_REQUESTS
+ };
+ 
+@@ -6884,6 +6938,9 @@ union generic_request
+     struct connect_alpc_port_request connect_alpc_port_request;
+     struct accept_alpc_connection_request accept_alpc_connection_request;
+     struct disconnect_alpc_port_request disconnect_alpc_port_request;
++    struct create_wait_completion_packet_request create_wait_completion_packet_request;
++    struct associate_wait_completion_packet_request associate_wait_completion_packet_request;
++    struct cancel_wait_completion_packet_request cancel_wait_completion_packet_request;
+ };
+ union generic_reply
+ {
+@@ -7200,8 +7257,11 @@ union generic_reply
+     struct connect_alpc_port_reply connect_alpc_port_reply;
+     struct accept_alpc_connection_reply accept_alpc_connection_reply;
+     struct disconnect_alpc_port_reply disconnect_alpc_port_reply;
++    struct create_wait_completion_packet_reply create_wait_completion_packet_reply;
++    struct associate_wait_completion_packet_reply associate_wait_completion_packet_reply;
++    struct cancel_wait_completion_packet_reply cancel_wait_completion_packet_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 943
++#define SERVER_PROTOCOL_VERSION 944
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/include/winternl.h b/include/winternl.h
+index bed72e8..396a33e 100644
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -4740,6 +4740,9 @@ NTSYSAPI NTSTATUS  WINAPI NtAlpcImpersonateClientOfPort(HANDLE,ALPC_PORT_MESSAGE
+ NTSYSAPI NTSTATUS  WINAPI NtAlpcSendWaitReceivePort(HANDLE,DWORD,ALPC_PORT_MESSAGE*,ALPC_MESSAGE_ATTRIBUTES*,ALPC_PORT_MESSAGE*, SIZE_T*,ALPC_MESSAGE_ATTRIBUTES*,LARGE_INTEGER*);
+ NTSYSAPI NTSTATUS  WINAPI NtAreMappedFilesTheSame(PVOID,PVOID);
+ NTSYSAPI NTSTATUS  WINAPI NtAssignProcessToJobObject(HANDLE,HANDLE);
++NTSYSAPI NTSTATUS  WINAPI NtAssociateWaitCompletionPacket(HANDLE,HANDLE,HANDLE,PVOID,PVOID,NTSTATUS,ULONG_PTR,BOOLEAN*);
++NTSYSAPI NTSTATUS  WINAPI NtCancelWaitCompletionPacket(HANDLE,BOOLEAN);
++NTSYSAPI NTSTATUS  WINAPI NtCreateWaitCompletionPacket(HANDLE*,ACCESS_MASK,OBJECT_ATTRIBUTES*);
+ NTSYSAPI NTSTATUS  WINAPI NtCallbackReturn(PVOID,ULONG,NTSTATUS);
+ NTSYSAPI NTSTATUS  WINAPI NtCancelIoFile(HANDLE,PIO_STATUS_BLOCK);
+ NTSYSAPI NTSTATUS  WINAPI NtCancelIoFileEx(HANDLE,PIO_STATUS_BLOCK,PIO_STATUS_BLOCK);
+diff --git a/server/alpc.c b/server/alpc.c
+index c92f900..d89500e 100644
+--- a/server/alpc.c
++++ b/server/alpc.c
+@@ -335,6 +335,9 @@ static int queue_connect_notification( struct alpc_port *server_port, unsigned i
+     list_add_tail( &server_port->msg_queue, &msg->entry );
+     wake_up( &server_port->obj, 0 );
+     reselect_alpc_port( server_port );
++    /* notify any wait completion packet associated with this port (the standard
++     * NtAssociateWaitCompletionPacket-based server wait used by CoreMessaging). */
++    signal_wait_completion_packets( &server_port->obj );
+     return 1;
+ }
+ 
+diff --git a/server/completion.c b/server/completion.c
+index 8242bf7..99712ce 100644
+--- a/server/completion.c
++++ b/server/completion.c
+@@ -453,3 +453,167 @@ DECL_HANDLER(query_completion)
+ 
+     release_object( completion );
+ }
++
++
++/* wait completion packet: posts an I/O completion packet when a target object
++ * becomes signaled. Used by NtCreateWaitCompletionPacket et al. */
++
++struct wait_completion_packet
++{
++    struct object       obj;            /* object header */
++    struct list         entry;          /* entry in wait_packet_list while associated */
++    struct completion  *completion;     /* target completion port (ref held) */
++    struct object      *target;         /* object being waited on (ref held) */
++    apc_param_t         ckey;           /* completion key */
++    apc_param_t         cvalue;         /* completion value (apc context) */
++    unsigned int        status;         /* completion status */
++    apc_param_t         information;     /* completion information */
++    int                 associated;     /* currently on wait_packet_list */
++};
++
++static struct list wait_packet_list = LIST_INIT(wait_packet_list);
++
++static void wait_completion_packet_dump( struct object *obj, int verbose );
++static void wait_completion_packet_destroy( struct object *obj );
++
++static const struct object_ops wait_completion_packet_ops =
++{
++    sizeof(struct wait_completion_packet), /* size */
++    &no_type,                       /* type */
++    wait_completion_packet_dump,    /* dump */
++    NULL,                           /* add_queue */
++    NULL,                           /* remove_queue */
++    NULL,                           /* signaled */
++    NULL,                           /* satisfied */
++    no_signal,                      /* signal */
++    no_get_fd,                      /* get_fd */
++    default_get_sync,               /* get_sync */
++    default_map_access,             /* map_access */
++    default_get_sd,                 /* get_sd */
++    default_set_sd,                 /* set_sd */
++    no_get_full_name,               /* get_full_name */
++    no_lookup_name,                 /* lookup_name */
++    no_link_name,                   /* link_name */
++    NULL,                           /* unlink_name */
++    no_open_file,                   /* open_file */
++    no_kernel_obj_list,             /* get_kernel_obj_list */
++    no_close_handle,                /* close_handle */
++    wait_completion_packet_destroy  /* destroy */
++};
++
++static void wait_completion_packet_dump( struct object *obj, int verbose )
++{
++    struct wait_completion_packet *packet = (struct wait_completion_packet *)obj;
++    fprintf( stderr, "Wait completion packet target=%p completion=%p\n",
++             packet->target, packet->completion );
++}
++
++static void wait_packet_disassociate( struct wait_completion_packet *packet )
++{
++    if (!packet->associated) return;
++    list_remove( &packet->entry );
++    if (packet->completion) { release_object( packet->completion ); packet->completion = NULL; }
++    if (packet->target) { release_object( packet->target ); packet->target = NULL; }
++    packet->associated = 0;
++}
++
++static void wait_completion_packet_destroy( struct object *obj )
++{
++    struct wait_completion_packet *packet = (struct wait_completion_packet *)obj;
++    wait_packet_disassociate( packet );
++}
++
++/* called when a target object becomes signaled (e.g. an ALPC port on connect);
++ * posts the associated completion packet(s) and disassociates them (one-shot). */
++void signal_wait_completion_packets( struct object *target )
++{
++    struct wait_completion_packet *packet, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( packet, next, &wait_packet_list, struct wait_completion_packet, entry )
++    {
++        if (packet->target != target) continue;
++        if (packet->completion)
++            add_completion( packet->completion, packet->ckey, packet->cvalue,
++                            packet->status, packet->information );
++        wait_packet_disassociate( packet );
++    }
++}
++
++DECL_HANDLER(create_wait_completion_packet)
++{
++    struct wait_completion_packet *packet;
++    struct unicode_str name;
++    struct object *root;
++    const struct security_descriptor *sd;
++    const struct object_attributes *objattr = get_req_object_attributes( &sd, &name, &root );
++
++    if (!objattr) return;
++
++    if ((packet = alloc_object( &wait_completion_packet_ops )))
++    {
++        packet->completion = NULL;
++        packet->target     = NULL;
++        packet->associated = 0;
++        list_init( &packet->entry );
++        reply->handle = alloc_handle( current->process, packet, req->access, objattr->attributes );
++        release_object( packet );
++    }
++
++    if (root) release_object( root );
++}
++
++DECL_HANDLER(associate_wait_completion_packet)
++{
++    struct wait_completion_packet *packet;
++    struct completion *completion;
++    struct object *target;
++
++    packet = (struct wait_completion_packet *)get_handle_obj( current->process, req->handle,
++                                                              0, &wait_completion_packet_ops );
++    if (!packet) return;
++
++    /* one association per packet */
++    wait_packet_disassociate( packet );
++
++    completion = get_completion_obj( current->process, req->completion, IO_COMPLETION_MODIFY_STATE );
++    if (!completion)
++    {
++        release_object( packet );
++        return;
++    }
++
++    target = get_handle_obj( current->process, req->target, SYNCHRONIZE, NULL );
++    if (!target)
++    {
++        release_object( completion );
++        release_object( packet );
++        return;
++    }
++
++    packet->completion  = completion;   /* ref held */
++    packet->target      = target;       /* ref held */
++    packet->ckey        = req->key;
++    packet->cvalue      = req->apc;
++    packet->status      = req->status;
++    packet->information  = req->information;
++    packet->associated  = 1;
++    list_add_tail( &wait_packet_list, &packet->entry );
++
++    reply->signaled = 0; /* edge-triggered: completion is posted on the next target signal */
++
++    release_object( packet );
++}
++
++DECL_HANDLER(cancel_wait_completion_packet)
++{
++    struct wait_completion_packet *packet;
++
++    packet = (struct wait_completion_packet *)get_handle_obj( current->process, req->handle,
++                                                              0, &wait_completion_packet_ops );
++    if (!packet) return;
++
++    reply->cancelled = packet->associated ? 1 : 0;
++    wait_packet_disassociate( packet );
++
++    release_object( packet );
++}
+diff --git a/server/file.h b/server/file.h
+index e1485e4..eb33592 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -241,6 +241,7 @@ extern struct completion *get_completion_obj( struct process *process, obj_handl
+ extern struct reserve *get_completion_reserve_obj( struct process *process, obj_handle_t handle, unsigned int access );
+ extern void add_completion( struct completion *completion, apc_param_t ckey, apc_param_t cvalue,
+                             unsigned int status, apc_param_t information );
++extern void signal_wait_completion_packets( struct object *target );
+ extern void cleanup_thread_completion( struct thread *thread );
+ 
+ /* serial port functions */
+diff --git a/server/protocol.def b/server/protocol.def
+index 60e8835..0f8b6e0 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4311,7 +4311,7 @@ enum inproc_sync_type
+ 
+ /* Connect to a named ALPC server port (client side) */
+ @REQ(connect_alpc_port)
+-    async_data_t        async;          /* async I/O parameters for blocking wait */
++    struct async_data   async;          /* async I/O parameters for blocking wait */
+     unsigned int        msg_id;         /* unique message ID for this connect request */
+     VARARG(objattr,object_attributes);  /* object attributes containing port name */
+ @REPLY
+@@ -4332,3 +4332,33 @@ enum inproc_sync_type
+ @REQ(disconnect_alpc_port)
+     obj_handle_t        handle;         /* ALPC port or connection handle */
+ @END
++
++
++/* Create a wait completion packet */
++@REQ(create_wait_completion_packet)
++    unsigned int        access;         /* desired access */
++    VARARG(objattr,object_attributes);  /* object attributes */
++@REPLY
++    obj_handle_t        handle;         /* wait packet handle */
++@END
++
++/* Associate a wait packet: post completion to a port when target signals */
++@REQ(associate_wait_completion_packet)
++    obj_handle_t        handle;         /* wait packet handle */
++    obj_handle_t        completion;     /* IO completion port handle */
++    obj_handle_t        target;         /* object to wait on */
++    unsigned int        status;         /* completion status to post */
++    apc_param_t         key;            /* completion key */
++    apc_param_t         apc;            /* completion value (apc context) */
++    apc_param_t         information;    /* completion information */
++@REPLY
++    int                 signaled;       /* was target already signaled */
++@END
++
++/* Cancel a wait completion packet association */
++@REQ(cancel_wait_completion_packet)
++    obj_handle_t        handle;         /* wait packet handle */
++    int                 remove_signaled;/* remove already-queued completion */
++@REPLY
++    int                 cancelled;      /* was an association cancelled */
++@END
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 2bcbafb..a701f07 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -318,6 +318,9 @@ DECL_HANDLER(create_alpc_port);
+ DECL_HANDLER(connect_alpc_port);
+ DECL_HANDLER(accept_alpc_connection);
+ DECL_HANDLER(disconnect_alpc_port);
++DECL_HANDLER(create_wait_completion_packet);
++DECL_HANDLER(associate_wait_completion_packet);
++DECL_HANDLER(cancel_wait_completion_packet);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+@@ -633,6 +636,9 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_connect_alpc_port,
+     (req_handler)req_accept_alpc_connection,
+     (req_handler)req_disconnect_alpc_port,
++    (req_handler)req_create_wait_completion_packet,
++    (req_handler)req_associate_wait_completion_packet,
++    (req_handler)req_cancel_wait_completion_packet,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+@@ -2410,4 +2416,22 @@ C_ASSERT( offsetof(struct accept_alpc_connection_reply, handle) == 8 );
+ C_ASSERT( sizeof(struct accept_alpc_connection_reply) == 16 );
+ C_ASSERT( offsetof(struct disconnect_alpc_port_request, handle) == 12 );
+ C_ASSERT( sizeof(struct disconnect_alpc_port_request) == 16 );
+-C_ASSERT( sizeof(struct disconnect_alpc_port_reply) == 8 );
++C_ASSERT( offsetof(struct create_wait_completion_packet_request, access) == 12 );
++C_ASSERT( sizeof(struct create_wait_completion_packet_request) == 16 );
++C_ASSERT( offsetof(struct create_wait_completion_packet_reply, handle) == 8 );
++C_ASSERT( sizeof(struct create_wait_completion_packet_reply) == 16 );
++C_ASSERT( offsetof(struct associate_wait_completion_packet_request, handle) == 12 );
++C_ASSERT( offsetof(struct associate_wait_completion_packet_request, completion) == 16 );
++C_ASSERT( offsetof(struct associate_wait_completion_packet_request, target) == 20 );
++C_ASSERT( offsetof(struct associate_wait_completion_packet_request, status) == 24 );
++C_ASSERT( offsetof(struct associate_wait_completion_packet_request, key) == 32 );
++C_ASSERT( offsetof(struct associate_wait_completion_packet_request, apc) == 40 );
++C_ASSERT( offsetof(struct associate_wait_completion_packet_request, information) == 48 );
++C_ASSERT( sizeof(struct associate_wait_completion_packet_request) == 56 );
++C_ASSERT( offsetof(struct associate_wait_completion_packet_reply, signaled) == 8 );
++C_ASSERT( sizeof(struct associate_wait_completion_packet_reply) == 16 );
++C_ASSERT( offsetof(struct cancel_wait_completion_packet_request, handle) == 12 );
++C_ASSERT( offsetof(struct cancel_wait_completion_packet_request, remove_signaled) == 16 );
++C_ASSERT( sizeof(struct cancel_wait_completion_packet_request) == 24 );
++C_ASSERT( offsetof(struct cancel_wait_completion_packet_reply, cancelled) == 8 );
++C_ASSERT( sizeof(struct cancel_wait_completion_packet_reply) == 16 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 7e95707..c8dcda4 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3525,40 +3525,81 @@ static void dump_create_alpc_port_request( const struct create_alpc_port_request
+ {
+     fprintf( stderr, " access=%08x", req->access );
+     fprintf( stderr, ", flags=%08x", req->flags );
+-    fprintf( stderr, ", max_msg_len=%u", req->max_msg_len );
++    fprintf( stderr, ", max_msg_len=%08x", req->max_msg_len );
+     dump_varargs_object_attributes( ", objattr=", cur_size );
+ }
++
+ static void dump_create_alpc_port_reply( const struct create_alpc_port_reply *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
+ }
++
+ static void dump_connect_alpc_port_request( const struct connect_alpc_port_request *req )
+ {
+     dump_async_data( " async=", &req->async );
+     fprintf( stderr, ", msg_id=%08x", req->msg_id );
+     dump_varargs_object_attributes( ", objattr=", cur_size );
+ }
++
+ static void dump_connect_alpc_port_reply( const struct connect_alpc_port_reply *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
+     fprintf( stderr, ", wait=%04x", req->wait );
+ }
++
+ static void dump_accept_alpc_connection_request( const struct accept_alpc_connection_request *req )
+ {
+     fprintf( stderr, " server_port=%04x", req->server_port );
+     fprintf( stderr, ", msg_id=%08x", req->msg_id );
+     fprintf( stderr, ", accept=%d", req->accept );
+ }
++
+ static void dump_accept_alpc_connection_reply( const struct accept_alpc_connection_reply *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
+ }
++
+ static void dump_disconnect_alpc_port_request( const struct disconnect_alpc_port_request *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
+ }
+-static void dump_disconnect_alpc_port_reply( const struct disconnect_alpc_port_reply *req )
++
++static void dump_create_wait_completion_packet_request( const struct create_wait_completion_packet_request *req )
++{
++    fprintf( stderr, " access=%08x", req->access );
++    dump_varargs_object_attributes( ", objattr=", cur_size );
++}
++
++static void dump_create_wait_completion_packet_reply( const struct create_wait_completion_packet_reply *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++}
++
++static void dump_associate_wait_completion_packet_request( const struct associate_wait_completion_packet_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", completion=%04x", req->completion );
++    fprintf( stderr, ", target=%04x", req->target );
++    fprintf( stderr, ", status=%08x", req->status );
++    dump_uint64( ", key=", &req->key );
++    dump_uint64( ", apc=", &req->apc );
++    dump_uint64( ", information=", &req->information );
++}
++
++static void dump_associate_wait_completion_packet_reply( const struct associate_wait_completion_packet_reply *req )
++{
++    fprintf( stderr, " signaled=%d", req->signaled );
++}
++
++static void dump_cancel_wait_completion_packet_request( const struct cancel_wait_completion_packet_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", remove_signaled=%d", req->remove_signaled );
++}
++
++static void dump_cancel_wait_completion_packet_reply( const struct cancel_wait_completion_packet_reply *req )
+ {
++    fprintf( stderr, " cancelled=%d", req->cancelled );
+ }
+ 
+ typedef void (*dump_func)( const void *req );
+@@ -3876,6 +3917,9 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_connect_alpc_port_request,
+     (dump_func)dump_accept_alpc_connection_request,
+     (dump_func)dump_disconnect_alpc_port_request,
++    (dump_func)dump_create_wait_completion_packet_request,
++    (dump_func)dump_associate_wait_completion_packet_request,
++    (dump_func)dump_cancel_wait_completion_packet_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+@@ -4191,6 +4235,9 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_connect_alpc_port_reply,
+     (dump_func)dump_accept_alpc_connection_reply,
+     NULL,
++    (dump_func)dump_create_wait_completion_packet_reply,
++    (dump_func)dump_associate_wait_completion_packet_reply,
++    (dump_func)dump_cancel_wait_completion_packet_reply,
+ };
+ 
+ static const char * const req_names[REQ_NB_REQUESTS] =
+@@ -4506,6 +4553,9 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "connect_alpc_port",
+     "accept_alpc_connection",
+     "disconnect_alpc_port",
++    "create_wait_completion_packet",
++    "associate_wait_completion_packet",
++    "cancel_wait_completion_packet",
+ };
+ 
+ static const struct
+-- 
+2.54.0
+
