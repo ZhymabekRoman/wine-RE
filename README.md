@@ -102,9 +102,10 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
 ### 9. `dcomp-DCompositionCreateDevice2`
 * **Path**: `patches/dcomp-DCompositionCreateDevice2/`
 * **Target Subsystem**: DirectComposition (`dcomp.dll`), `dxgi`
-* **Patches (0001–0067)**:
+* **Patches (0001–0068)**:
   * `0001–0066`: CodeWeavers DComposition patchset (Zhiyi Zhang). Implements `IDCompositionDevice/2/3`, `IDCompositionDesktopDevicePartner`, `IDCompositionTarget`, `IDCompositionVisual2`, `IDCompositionSurface`, and `CreateSwapChainForComposition` stubs.
   * `0067`: Exports 11 `DCompPrivates_*` stubs needed for `Microsoft.Internal.FrameworkUdk.dll` delay-import resolution.
+  * `0068`: Prevents premature compositor worker thread termination on empty initial tick and uses unclipped window DC (`GetDC`) for `GdiAlphaBlend` presentation across child window hierarchies.
 
 ---
 
