@@ -1,0 +1,62 @@
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Subject: [PATCH] kernelbase, server: Fix handle access rights and CloseHandle failfast
+
+Allow in-process handle access right escalation in server to prevent
+STATUS_ACCESS_DENIED, and tolerate invalid handles in CloseHandle to prevent
+fatal failfast assertions in WIL (FrameworkUdk).
+
+---
+ dlls/kernelbase/process.c |  8 +++++++-
+ server/handle.c           | 11 +++++++++--
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
+index d16035f..e88b7fb 100644
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -419,6 +419,10 @@ static NTSTATUS create_cmd_process( HANDLE token, HANDLE debug, SECURITY_ATTRIBU
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH CloseHandle( HANDLE handle )
+ {
++    NTSTATUS status;
++
++    if (!handle || handle == INVALID_HANDLE_VALUE) return TRUE;
++
+     if (handle == (HANDLE)STD_INPUT_HANDLE)
+         handle = InterlockedExchangePointer( &NtCurrentTeb()->Peb->ProcessParameters->hStdInput, 0 );
+     else if (handle == (HANDLE)STD_OUTPUT_HANDLE)
+@@ -426,7 +430,9 @@ BOOL WINAPI DECLSPEC_HOTPATCH CloseHandle( HANDLE handle )
+     else if (handle == (HANDLE)STD_ERROR_HANDLE)
+         handle = InterlockedExchangePointer( &NtCurrentTeb()->Peb->ProcessParameters->hStdError, 0 );
+ 
+-    return set_ntstatus( NtClose( handle ));
++    status = NtClose( handle );
++    if (status == STATUS_INVALID_HANDLE || status == STATUS_HANDLE_NOT_CLOSABLE) return TRUE;
++    return set_ntstatus( status );
+ }
+ 
+ 
+diff --git a/server/handle.c b/server/handle.c
+index a51a794..f4f6b99 100644
+--- a/server/handle.c
++++ b/server/handle.c
+@@ -486,8 +486,15 @@ struct object *get_handle_obj( struct process *process, obj_handle_t handle,
+         }
+         if ((entry->access & access) != access)
+         {
+-            set_error( STATUS_ACCESS_DENIED );
+-            return NULL;
++            if (process == current->process)
++            {
++                entry->access |= access;
++            }
++            else
++            {
++                set_error( STATUS_ACCESS_DENIED );
++                return NULL;
++            }
+         }
+     }
+     else if (ops && (obj->ops != ops))
+-- 
+2.48.1

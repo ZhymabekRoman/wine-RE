@@ -1,0 +1,49 @@
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Subject: [PATCH] server/alpc: Route client data messages to peer communication port
+
+When client communication port has a connected peer, data messages must be
+delivered to peer rather than fallback listening port.
+
+---
+ server/alpc.c | 17 +++++++++--------
+ 1 file changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/server/alpc.c b/server/alpc.c
+index 03f14e2..3993e87 100644
+--- a/server/alpc.c
++++ b/server/alpc.c
+@@ -346,15 +346,16 @@ static void alpc_fd_write( struct fd *fd, struct async *async, file_pos_t pos )
+             peer = LIST_ENTRY( head, struct alpc_port, conn_entry );
+         }
+     }
+-    else if (!port->peer)
++    else
+     {
+-        release_object( iosb );
+-        set_error( STATUS_PIPE_DISCONNECTED );
+-        return;
++        peer = port->peer ? port->peer : port->listen_port;
++        if (!peer)
++        {
++            release_object( iosb );
++            set_error( STATUS_PIPE_DISCONNECTED );
++            return;
++        }
+     }
+-    /* The client side delivers to the server's listening port (where the server
+-     * receives all connections' messages); the server side replies to its peer. */
+-    else peer = port->listen_port ? port->listen_port : port->peer;
+ 
+     {
+         struct alpc_wire_hdr *hdr;
+@@ -367,7 +368,7 @@ static void alpc_fd_write( struct fd *fd, struct async *async, file_pos_t pos )
+          * the destination client's connection context. */
+         client_ptr_t ctx;
+         if (port->is_server)        ctx = peer->port_context;
+-        else if (port->listen_port) ctx = port->peer->port_context;
++        else if (port->peer)        ctx = port->peer->port_context;
+         else                        ctx = port->port_context;
+ 
+         memset( &attr_hdr, 0, sizeof(attr_hdr) );
+-- 
+2.48.1

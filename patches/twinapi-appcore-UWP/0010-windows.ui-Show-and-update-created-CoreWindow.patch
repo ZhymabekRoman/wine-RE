@@ -1,0 +1,29 @@
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Subject: [PATCH] windows.ui: Show and update created CoreWindow
+
+Make created CoreWindow visible with WS_VISIBLE, ShowWindow(SW_SHOW),
+and UpdateWindow.
+
+---
+ dlls/windows.ui/corewindow.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/windows.ui/corewindow.c b/dlls/windows.ui/corewindow.c
+index ee30afd..4e737ce 100644
+--- a/dlls/windows.ui/corewindow.c
++++ b/dlls/windows.ui/corewindow.c
+@@ -539,9 +539,11 @@ ICoreWindow *core_window_create(void)
+     RegisterClassExW( &wc );
+ 
+     impl->hwnd = CreateWindowExW( 0, class_name, NULL,
+-                                  WS_OVERLAPPEDWINDOW,
++                                  WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                   CW_USEDEFAULT, CW_USEDEFAULT, 1024, 768,
+                                   NULL, NULL, inst, NULL );
++    ShowWindow( impl->hwnd, SW_SHOW );
++    UpdateWindow( impl->hwnd );
+     TRACE( "created CoreWindow %p, hwnd %p\n", impl, impl->hwnd );
+     return &impl->ICoreWindow_iface;
+ }
+-- 
+2.48.1
