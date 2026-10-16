@@ -1,18 +1,18 @@
 From: Zhymabek Roman <robanokssamit@yandex.ru>
-Subject: [PATCH] server/alpc: Route client data messages to peer communication port
+Subject: [PATCH] server/alpc: Route client data messages to peer or listening port depending on waiter
 
-When client communication port has a connected peer, data messages must be
-delivered to peer rather than fallback listening port.
+When client sends a message, deliver to peer communication port if a receiver is waiting
+there, or to the listening port if the server thread is waiting for connections on the listening port.
 
 ---
- server/alpc.c | 17 +++++++++--------
- 1 file changed, 9 insertions(+), 8 deletions(-)
+ server/alpc.c | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
 
 diff --git a/server/alpc.c b/server/alpc.c
-index 03f14e2..3993e87 100644
+index 03f14e2..269107e 100644
 --- a/server/alpc.c
 +++ b/server/alpc.c
-@@ -346,15 +346,16 @@ static void alpc_fd_write( struct fd *fd, struct async *async, file_pos_t pos )
+@@ -346,15 +346,20 @@ static void alpc_fd_write( struct fd *fd, struct async *async, file_pos_t pos )
              peer = LIST_ENTRY( head, struct alpc_port, conn_entry );
          }
      }
@@ -22,7 +22,17 @@ index 03f14e2..3993e87 100644
 -        release_object( iosb );
 -        set_error( STATUS_PIPE_DISCONNECTED );
 -        return;
-+        peer = port->peer ? port->peer : port->listen_port;
++        /* Deliver to peer communication port if a receiver is waiting there,
++         * or to the listening port if the server is receiving all connections there. */
++        if (port->peer && async_waiting( &port->peer->read_q ))
++            peer = port->peer;
++        else if (port->listen_port && async_waiting( &port->listen_port->read_q ))
++            peer = port->listen_port;
++        else if (port->listen_port)
++            peer = port->listen_port;
++        else
++            peer = port->peer;
++
 +        if (!peer)
 +        {
 +            release_object( iosb );

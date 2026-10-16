@@ -62,7 +62,7 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
 * **Path**: `patches/twinapi-appcore-UWP/`
 * **Target Subsystem**: `twinapi.appcore.dll`, `windows.ui.dll`, Dispatcher
 * **Depends on**: `kernelbase-PackageIdentity`
-* **Patches (0001–0010)**:
+* **Patches (0001–0011)**:
   * `0001`: Implements `ICoreApplication` interface on CoreApplication factory.
   * `0002`: Implements `CoreApplication.Run` and minimal `CoreApplicationView`.
   * `0003`: Wires `CoreWindow` into `FrameworkView.SetWindow`.
@@ -73,6 +73,7 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
   * `0008`: Extends `IStaticLifetime` vtable and adds `ICoreApplication2`.
   * `0009`: Creates `DispatcherQueueController` and `DispatcherQueue` pump before `FrameworkView.Initialize`.
   * `0010`: Implements real Win32 `HWND` backing for `CoreWindow`, `ICoreWindowInterop` (`45d64a29-a63e-4cb6-b498-5781d297cb98`), `WS_VISIBLE`, `ShowWindow(SW_SHOW)`, and UWP `IActivatedEventArgs` launch event dispatch.
+  * `0011`: Implements `Windows.ApplicationModel.AppInstance` factory and `IAppInstanceStatics::GetActivatedEventArgs` to satisfy `Microsoft.Windows.AppLifecycle.AppInstance.GetActivatedEventArgs()` in WASDK.
 
 ### 5. `combase-AgileObject`
 * **Path**: `patches/combase-AgileObject/`
