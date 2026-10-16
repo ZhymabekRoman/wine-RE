@@ -1,0 +1,131 @@
+From 456e954750eb77023b8ade06f8aa507cfbb209b5 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Fri, 16 Oct 2026 10:42:25 +0500
+Subject: [PATCH] server/alpc: Support OBJ_OPENIF and correlated ALPC sync
+ request/reply matching
+
+---
+ dlls/ntdll/unix/alpc.c |  3 ++-
+ server/alpc.c          | 23 +++++++++++++----------
+ server/async.c         | 13 +++++++++++++
+ server/file.h          |  1 +
+ 4 files changed, 29 insertions(+), 11 deletions(-)
+
+diff --git a/dlls/ntdll/unix/alpc.c b/dlls/ntdll/unix/alpc.c
+index 8fb7add..d2bcf46 100644
+--- a/dlls/ntdll/unix/alpc.c
++++ b/dlls/ntdll/unix/alpc.c
+@@ -512,9 +512,10 @@ NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, DWORD flags,
+ 
+     {
+     data_size_t reply_size = 0;
++    void *expected_id = (flags & 0x20000 && send_msg) ? (void *)(ULONG_PTR)send_msg->MessageId : NULL;
+     SERVER_START_REQ( read )
+     {
+-        req->async = server_async( port_handle, &async->io, NULL, NULL, NULL, iosb_client_ptr( &io ) );
++        req->async = server_async( port_handle, &async->io, NULL, NULL, expected_id, iosb_client_ptr( &io ) );
+         req->pos   = 0;
+         wine_server_set_reply( req, recv_msg, recv_size );
+         ret = wine_server_call( req );
+diff --git a/server/alpc.c b/server/alpc.c
+index e45e803..f31dd77 100644
+--- a/server/alpc.c
++++ b/server/alpc.c
+@@ -251,15 +251,16 @@ static enum server_fd_type alpc_fd_get_type( struct fd *fd )
+ /* Deliver queued messages to pending async readers. */
+ static void reselect_alpc_port( struct alpc_port *port )
+ {
+-    struct async *async;
++    struct alpc_message *msg, *next;
+ 
+-    while (!list_empty( &port->msg_queue )
+-           && (async = find_pending_async( &port->read_q )))
++    LIST_FOR_EACH_ENTRY_SAFE( msg, next, &port->msg_queue, struct alpc_message, entry )
+     {
+-        struct alpc_message *msg = LIST_ENTRY( list_head(&port->msg_queue),
+-                                               struct alpc_message, entry );
+-        struct iosb *iosb = async_get_iosb( async );
++        struct async *async = find_pending_alpc_async( &port->read_q, msg->msg_id );
++        struct iosb *iosb;
+ 
++        if (!async) continue;
++
++        iosb = async_get_iosb( async );
+         if (iosb->out_size < msg->data_size)
+         {
+             async_request_complete( async, STATUS_BUFFER_TOO_SMALL, 0, 0, NULL );
+@@ -272,7 +273,6 @@ static void reselect_alpc_port( struct alpc_port *port )
+             list_remove( &msg->entry );
+             free( msg );
+         }
+-
+         release_object( iosb );
+         release_object( async );
+     }
+@@ -354,13 +354,16 @@ static void alpc_fd_write( struct fd *fd, struct async *async, file_pos_t pos )
+             return;
+         }
+         msg->is_connect = 0;
+-        msg->msg_id     = 0;
++        if (user_size >= 0x1c)
++            msg->msg_id = *(const unsigned int *)((const char *)user_data + 0x18);
++        else
++            msg->msg_id = 0;
+         msg->data_size  = blob_size;
+ 
+         hdr = (struct alpc_wire_hdr *)((char *)msg + sizeof(*msg));
+         hdr->magic        = ALPC_WIRE_MAGIC;
+         hdr->type         = 1; /* LPC_REQUEST/REPLY – distinguished by the user PORT_MESSAGE */
+-        hdr->msg_id       = 0;
++        hdr->msg_id       = msg->msg_id;
+         hdr->client_pid   = get_process_id( current->process );
+         hdr->client_tid   = get_thread_id( current );
+         hdr->user_size    = user_size;
+@@ -460,7 +463,7 @@ DECL_HANDLER(create_alpc_port)
+ 
+     if (!objattr) return;
+ 
+-    port = create_named_object( root, &alpc_port_ops, &name, objattr->attributes, sd );
++    port = create_named_object( root, &alpc_port_ops, &name, objattr->attributes | OBJ_OPENIF, sd );
+     if (root) release_object( root );
+     if (!port) return;
+ 
+diff --git a/server/async.c b/server/async.c
+index d7f665b..f4354e8 100644
+--- a/server/async.c
++++ b/server/async.c
+@@ -927,6 +927,19 @@ struct async *find_pending_async( struct async_queue *queue )
+     return NULL;
+ }
+ 
++/* find an async in queue matching a specific ALPC message id */
++struct async *find_pending_alpc_async( struct async_queue *queue, unsigned int msg_id )
++{
++    struct async *async;
++    LIST_FOR_EACH_ENTRY( async, &queue->queue, struct async, queue_entry )
++    {
++        if (async->terminated) continue;
++        if (!async->data.apc_context || (unsigned int)async->data.apc_context == msg_id)
++            return (struct async *)grab_object( async );
++    }
++    return NULL;
++}
++
+ /* cancels sync I/O on a thread */
+ DECL_HANDLER(cancel_sync)
+ {
+diff --git a/server/file.h b/server/file.h
+index eb33592..bb5a9dc 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -279,6 +279,7 @@ extern void fd_copy_completion( struct fd *src, struct fd *dst );
+ extern struct iosb *async_get_iosb( struct async *async );
+ extern struct thread *async_get_thread( struct async *async );
+ extern struct async *find_pending_async( struct async_queue *queue );
++extern struct async *find_pending_alpc_async( struct async_queue *queue, unsigned int msg_id );
+ extern void cancel_terminating_process_asyncs( struct process *process );
+ extern void cancel_terminating_thread_asyncs( struct thread *thread );
+ extern int async_close_obj_handle( struct object *obj, struct process *process, obj_handle_t handle );
+-- 
+2.56.0
+

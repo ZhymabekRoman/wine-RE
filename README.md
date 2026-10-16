@@ -36,7 +36,7 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
   * `0005`: ALPC post-accept message routing + per-client `PortContext` and `ClientId` delivery.
   * `0006`: Stamps ALPC message `Type` and assigns `MessageId`; fixes send use-after-free.
   * `0007`: Corrects per-message `PortContext` for reply direction.
-  * `0008`: Implements ALPC Section Views (`NtAlpcCreatePortSection`, `NtAlpcCreateSectionView`, `NtAlpcDeletePortSection`, `NtAlpcDeleteSectionView`) and `ALPC_MESSAGE_VIEW_ATTRIBUTE` (0x40000000) wire propagation for shared memory transport.
+  * `0008`: Implements `OBJ_OPENIF` named port reuse and correlated synchronous request/reply matching by `MessageId` in wineserver async queue (resolves CoreMessaging in-process registrar collision `0xc0000035` and `CoreUICallReceive` empty parameter decode crash).
 
 ### 3. `kernelbase-PackageIdentity`
 * **Path**: `patches/kernelbase-PackageIdentity/`
