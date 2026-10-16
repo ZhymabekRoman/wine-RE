@@ -1,10 +1,19 @@
-# Wine-RE: Wine Staging Patches for Modern Windows Apps & UWP/WinUI 3
+# wine-ultimate: Wine Staging Patches for Modern Windows Apps & UWP/WinUI 3
 
 Experimental Wine Staging patch tree focused on reverse-engineering and implementing modern Windows NT kernel and userland subsystems required by **WinUI 3**, **Windows App SDK (WASDK)**, and native UWP runtimes.
 
 Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, the final native WinUI 3 / XAML line using `WindowsAppRuntime.1.6` and `Microsoft.UI.Xaml 3.0.0.2411`).
 
 **Base**: Wine Staging **v11.19** (`11dd86bd`) / Upstream Wine `a15ee2c`.
+
+---
+
+## Current Status: WhatsApp Desktop Running
+
+* **Process State**: Running stably (`WhatsApp.Root.exe`, PID active, 440MB+ RSS).
+* **Display / Window**: Top-level 1016×734 window is successfully mapped to X11 display (`Map State: IsViewable`).
+* **Graphics Stack**: DirectWrite, Direct2D, DXGI, and Direct3D 11 device contexts initialized.
+* **CoreMessaging / ALPC Bus**: Full bidirectional handshake and data message exchange functional across UI, Registrar, and DWM manipulation threads.
 
 ---
 
@@ -28,7 +37,7 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
 * **Path**: `patches/ntdll-WaitCompletionPacket/`
 * **Target Subsystem**: NTDLL & Wineserver Async Wait Completion Engine & ALPC Message Bus
 * **Depends on**: `ntdll-NtAlpcCreatePort`
-* **Patches (0001–0009)**:
+* **Patches (0001–0010)**:
   * `0001`: Implements `NtCreateWaitCompletionPacket`, `NtAssociateWaitCompletionPacket`, and `NtCancelWaitCompletionPacket` + wineserver completion packet object.
   * `0002`: Emulates Windows kernel ALPC connection handshake behavior expected by `CoreMessagingXP.dll`, status `0x87b2080c`, and flag byte checks at offset `+0x3a`.
   * `0003`: Transports ALPC connection-message payload and `ClientId`.
@@ -38,15 +47,16 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
   * `0007`: Corrects per-message `PortContext` for reply direction.
   * `0008`: Implements `OBJ_OPENIF` named port reuse and correlated synchronous request/reply matching by `MessageId` in wineserver async queue (resolves CoreMessaging in-process registrar collision `0xc0000035` and `CoreUICallReceive` empty parameter decode crash).
   * `0009`: Server-side multi-connection reply routing by `MessageId` across multiple client connection endpoints on the listening port.
+  * `0010`: Routes client data messages directly to connected communication `peer` rather than fallback listening port, resolving `0x87B2000C` validate buffer error in `CoreMessagingXP.dll` during "Lifted" endpoint registration.
 
 ### 3. `kernelbase-PackageIdentity`
 * **Path**: `patches/kernelbase-PackageIdentity/`
-* **Target Subsystem**: KernelBase / AppModel
+* **Target Subsystem**: KernelBase / AppModel & Wineserver Object Handles
 * **Patches (0001–0004)**:
   * `0001`: Reports package identity parsed from environment variables (`PACKAGE_FAMILY_NAME`, `PACKAGE_FULL_NAME`) for unpackaged / standalone runtime launch.
   * `0002`: Implements `GetCurrentPackageId`, `GetCurrentPackageInfo`, `GetCurrentPackagePath`, and `GetPackagePathByFullName`.
   * `0003`: `AppPolicyGetWindowingModel` returns `AppPolicyWindowingModel_Universal` for packaged apps to bypass AppContainer sandboxing checks in CoreMessaging.
-  * `0004`: Implements `PackageFamilyNameFromFullName` and `PackageFamilyNameFromId` and adds configurable windowing model support (`WINE_WINDOWING_MODEL`).
+  * `0004`: Allows in-process handle access right escalation (`entry->access |= access`) in wineserver to eliminate false-positive `STATUS_ACCESS_DENIED` (`0xc0000022` / `0xd0000022`), and makes `CloseHandle` non-fatal on invalid/unclosable handles to avoid WIL failfast assertions in `FrameworkUdk.dll`.
 
 ### 4. `twinapi-appcore-UWP`
 * **Path**: `patches/twinapi-appcore-UWP/`
@@ -62,7 +72,7 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
   * `0007`: Adds `ICoreApplicationUnhandledError` to CoreApplication factory.
   * `0008`: Extends `IStaticLifetime` vtable and adds `ICoreApplication2`.
   * `0009`: Creates `DispatcherQueueController` and `DispatcherQueue` pump before `FrameworkView.Initialize`.
-  * `0010`: Implements real Win32 `HWND` backing for `CoreWindow`, `ICoreWindowInterop` (`45d64a29-a63e-4cb6-b498-5781d297cb98`), `ShowWindow(SW_SHOW)`, and UWP `IActivatedEventArgs` launch event dispatch.
+  * `0010`: Implements real Win32 `HWND` backing for `CoreWindow`, `ICoreWindowInterop` (`45d64a29-a63e-4cb6-b498-5781d297cb98`), `WS_VISIBLE`, `ShowWindow(SW_SHOW)`, and UWP `IActivatedEventArgs` launch event dispatch.
 
 ### 5. `combase-AgileObject`
 * **Path**: `patches/combase-AgileObject/`
