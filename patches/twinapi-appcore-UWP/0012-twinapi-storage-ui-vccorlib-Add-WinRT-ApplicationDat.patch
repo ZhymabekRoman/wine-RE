@@ -1,0 +1,906 @@
+From 4736163315f7f30871ad532f3434137610fd4376 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Fri, 16 Oct 2026 18:11:20 +0500
+Subject: [PATCH] twinapi, storage, ui, vccorlib: Add WinRT ApplicationData,
+ CoreCursor, and PropertySet
+
+---
+ dlls/combase/roapi.c                          |  21 +-
+ dlls/kernelbase/main.c                        |   3 +-
+ dlls/ntdll/unix/thread.c                      |  15 +
+ dlls/twinapi.appcore/core_application.c       |  62 ++-
+ dlls/vccorlib140/vccorlib.c                   |   8 +
+ dlls/vccorlib140/vccorlib140.spec             |   6 +-
+ dlls/windows.globalization/main.c             |   9 +-
+ .../applicationdata.c                         | 358 +++++++++++++++++-
+ .../windows.storage.applicationdata/private.h |   2 +
+ dlls/windows.ui/corewindow.c                  | 182 ++++++++-
+ dlls/windows.ui/main.c                        |   3 +
+ dlls/windows.ui/private.h                     |   1 +
+ 12 files changed, 639 insertions(+), 31 deletions(-)
+
+diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
+index f4f7c0a..1f9b356 100644
+--- a/dlls/combase/roapi.c
++++ b/dlls/combase/roapi.c
+@@ -431,9 +431,26 @@ HRESULT WINAPI RoGetAgileReference(enum AgileReferenceOptions option, REFIID rii
+ /***********************************************************************
+  *      RoFailFastWithErrorContextInternal2 (combase.@)
+  */
+-void WINAPI RoFailFastWithErrorContextInternal2(HRESULT error, ULONG exception_count, /* PSTOWED_EXCEPTION_INFORMATION_V2 */void *information)
++void WINAPI RoFailFastWithErrorContextInternal2(HRESULT error, ULONG exception_count, void *information)
+ {
++    ULONG i;
+     FIXME("%#lx, %lu, %p stub.\n", error, exception_count, information);
++    if (information && exception_count)
++    {
++        void **ptrs = (void **)information;
++        for (i = 0; i < exception_count; i++)
++        {
++            void *p = ptrs[i];
++            if (p)
++            {
++                ULONG *u = (ULONG *)p;
++                WCHAR *desc;
++                FIXME("  stowed[%lu]: sig=%#lx hr=%#lx\n", i, u[0], u[2]);
++                desc = *(WCHAR **)((char *)p + 0x38);
++                if (desc) FIXME("  stowed[%lu] desc: %s\n", i, wine_dbgstr_w(desc));
++            }
++        }
++    }
+     RaiseFailFastException(NULL, NULL, 0);
+ }
+ 
+@@ -534,7 +551,7 @@ BOOL WINAPI RoOriginateError(HRESULT error, HSTRING message)
+  */
+ BOOL WINAPI RoOriginateErrorW(HRESULT error, UINT max_len, const WCHAR *message)
+ {
+-    FIXME("%#lx, %u, %p: stub\n", error, max_len, message);
++    FIXME("%#lx, %u, %s: stub\n", error, max_len, wine_dbgstr_wn(message, max_len));
+     return FALSE;
+ }
+ 
+diff --git a/dlls/kernelbase/main.c b/dlls/kernelbase/main.c
+index d0faacf..e984ee7 100644
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -140,7 +140,7 @@ LONG WINAPI AppPolicyGetWindowingModel(HANDLE token, AppPolicyWindowingModel *po
+ {
+     static int once;
+     const WCHAR *pkg = NULL;
+-    WCHAR buf[8];
++    WCHAR buf[32];
+ 
+     if(!once++)
+         FIXME("%p, %p\n", token, policy);
+@@ -156,6 +156,7 @@ LONG WINAPI AppPolicyGetWindowingModel(HANDLE token, AppPolicyWindowingModel *po
+     else
+         *policy = AppPolicyWindowingModel_ClassicDesktop;
+ 
++    FIXME("token %p, policy %p -> windowing model %d\n", token, policy, *policy);
+     (void)pkg;
+     return ERROR_SUCCESS;
+ }
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 546963a..133b0f7 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1647,6 +1647,10 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL
+     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
+         return NtContinue( context, FALSE );
+ 
++    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION && context)
++        ERR_(seh)("FIRST_CHANCE_AV addr %p rip=%p rsp=%p\n",
++                  rec->ExceptionAddress, (void *)context->Rip, (void *)context->Rsp);
++
+     if (first_chance) return call_user_exception_dispatcher( data, rec, context );
+ 
+     if (rec->ExceptionFlags & EXCEPTION_STACK_INVALID)
+@@ -1654,8 +1658,19 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL
+     else if (rec->ExceptionCode == STATUS_NONCONTINUABLE_EXCEPTION)
+         ERR_(seh)("Process attempted to continue execution after noncontinuable exception.\n");
+     else
++    {
+         ERR_(seh)("Unhandled exception code %x flags %x addr %p\n",
+                   rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress );
++        if (rec->ExceptionCode == 0xe0464645 && context)
++        {
++            ULONG64 *sp = (ULONG64 *)context->Rsp;
++            int i;
++            for (i = 0; i < 32; i++)
++            {
++                ERR_(seh)("  failfast_stack[%02d] (%p) = %016llx\n", i, sp + i, sp[i]);
++            }
++        }
++    }
+ 
+     NtTerminateProcess( NtCurrentProcess(), rec->ExceptionCode );
+     return STATUS_SUCCESS;
+diff --git a/dlls/twinapi.appcore/core_application.c b/dlls/twinapi.appcore/core_application.c
+index ff80516..cbf4888 100644
+--- a/dlls/twinapi.appcore/core_application.c
++++ b/dlls/twinapi.appcore/core_application.c
+@@ -240,9 +240,29 @@ static HRESULT WINAPI core_application_view_GetTrustLevel( ICoreApplicationView
+ }
+ static HRESULT WINAPI core_application_view_get_CoreWindow( ICoreApplicationView *iface, __x_ABI_CWindows_CUI_CCore_CICoreWindow **value )
+ {
+-    FIXME( "iface %p, value %p semi-stub.\n", iface, value );
+-    if (value) *value = NULL;
+-    return S_OK;
++    IActivationFactory *cwf = NULL;
++    __x_ABI_CWindows_CUI_CCore_CICoreWindowStatic *cws = NULL;
++    HSTRING class_id = NULL;
++    HRESULT hr = S_OK;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++
++    WindowsCreateString( RuntimeClass_Windows_UI_Core_CoreWindow,
++                         wcslen( RuntimeClass_Windows_UI_Core_CoreWindow ), &class_id );
++    if (SUCCEEDED(RoGetActivationFactory( class_id, &IID_IActivationFactory, (void **)&cwf )) && cwf)
++    {
++        IActivationFactory_QueryInterface( cwf, &IID___x_ABI_CWindows_CUI_CCore_CICoreWindowStatic,
++                                           (void **)&cws );
++        if (cws)
++        {
++            hr = __x_ABI_CWindows_CUI_CCore_CICoreWindowStatic_GetForCurrentThread( cws, value );
++            __x_ABI_CWindows_CUI_CCore_CICoreWindowStatic_Release( cws );
++        }
++        IActivationFactory_Release( cwf );
++    }
++    WindowsDeleteString( class_id );
++    return hr;
+ }
+ struct activated_event_args
+ {
+@@ -262,7 +282,8 @@ static HRESULT WINAPI activated_event_args_QueryInterface( __x_ABI_CWindows_CApp
+     if (IsEqualGUID( iid, &IID_IUnknown ) ||
+         IsEqualGUID( iid, &IID_IInspectable ) ||
+         IsEqualGUID( iid, &IID_IAgileObject ) ||
+-        IsEqualGUID( iid, &IID___x_ABI_CWindows_CApplicationModel_CActivation_CIActivatedEventArgs ))
++        IsEqualGUID( iid, &IID___x_ABI_CWindows_CApplicationModel_CActivation_CIActivatedEventArgs ) ||
++        !memcmp( iid, "\x26\x3e\xc9\xfb\x4a\xa1\x4f\x4b\x82\xb0\x33\xbe\xd9\x20\xaf\x52", 16 ))
+     {
+         InterlockedIncrement( &impl->ref );
+         *out = &impl->IActivatedEventArgs_iface;
+@@ -476,9 +497,29 @@ static HRESULT WINAPI core_application_remove_Resuming( ICoreApplication *iface,
+ 
+ static HRESULT WINAPI core_application_get_Properties( ICoreApplication *iface, IPropertySet **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    if (value) *value = NULL;
+-    return E_NOTIMPL;
++    static IPropertySet *properties;
++    HSTRING class_id;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p\n", iface, value );
++    if (!value) return E_POINTER;
++    if (properties)
++    {
++        *value = properties;
++        IPropertySet_AddRef( properties );
++        return S_OK;
++    }
++
++    static const WCHAR name[] = L"Windows.Foundation.Collections.PropertySet";
++    WindowsCreateString( name, wcslen(name), &class_id );
++    hr = RoActivateInstance( class_id, (IInspectable **)&properties );
++    WindowsDeleteString( class_id );
++    if (SUCCEEDED(hr))
++    {
++        *value = properties;
++        IPropertySet_AddRef( properties );
++    }
++    return hr;
+ }
+ 
+ static HRESULT WINAPI core_application_GetCurrentView( ICoreApplication *iface, ICoreApplicationView **value )
+@@ -505,14 +546,15 @@ static HRESULT WINAPI core_application_Run( ICoreApplication *iface, IFrameworkV
+      * tick (CCoreServices::Tick → DCompTreeHost → CreateConversationHost) that
+      * creates the CoreUI ConversationServer (the dispatch handler at endpoint+0x58).
+      * Without it the first CoreUI message dispatches against an empty table → AV. */
+-    if ((cm = GetModuleHandleW( L"CoreMessagingXP.dll" )))
++    /* Do not block on DispatcherQueueController in UWP CoreApplication.Run */
++    if (0 && (cm = GetModuleHandleW( L"CoreMessagingXP.dll" )))
+     {
+         HRESULT (WINAPI *p_create_dqc)(void *, IInspectable **) =
+             (void *)GetProcAddress( cm, "WinUICreateDispatcherQueueController" );
+         if (p_create_dqc)
+         {
+-            /* DispatcherQueueOptions { dwSize=12, threadType=1(CURRENT_THREAD), apartment=2(MTA) } */
+-            struct { DWORD dwSize; DWORD threadType; DWORD apartment; } opts = { 12, 1, 2 };
++            /* DispatcherQueueOptions { dwSize=12, threadType=2(CURRENT_THREAD), apartment=2(MTA) } */
++            struct { DWORD dwSize; DWORD threadType; DWORD apartment; } opts = { 12, 2, 2 };
+             IInspectable *dqc = NULL;
+             HRESULT dqhr = p_create_dqc( &opts, &dqc );
+             FIXME( "DispatcherQueueController hr=%#lx obj=%p\n", dqhr, dqc );
+diff --git a/dlls/vccorlib140/vccorlib.c b/dlls/vccorlib140/vccorlib.c
+index 39b55de..fe01427 100644
+--- a/dlls/vccorlib140/vccorlib.c
++++ b/dlls/vccorlib140/vccorlib.c
+@@ -69,6 +69,14 @@ HRESULT WINAPI GetActivationFactoryByPCWSTR(const WCHAR *name, const GUID *iid,
+     return RoGetActivationFactory(str, iid, out);
+ }
+ 
++HRESULT WINAPI Platform_Details_GetActivationFactory(void *module, HSTRING class_id, IActivationFactory **factory)
++{
++    TRACE("(%p, %s, %p)\n", module, debugstr_hstring(class_id), factory);
++    if (!factory) return E_POINTER;
++    *factory = NULL;
++    return RoGetActivationFactory(class_id, &IID_IActivationFactory, (void **)factory);
++}
++
+ HRESULT WINAPI GetIidsFn(unsigned int count, unsigned int *copied, const GUID *src, GUID **dest)
+ {
+     TRACE("(%u, %p, %p, %p)\n", count, copied, src, dest);
+diff --git a/dlls/vccorlib140/vccorlib140.spec b/dlls/vccorlib140/vccorlib140.spec
+index 2aab6f6..e74fe99 100644
+--- a/dlls/vccorlib140/vccorlib140.spec
++++ b/dlls/vccorlib140/vccorlib140.spec
+@@ -70,9 +70,9 @@
+ @ cdecl -arch=win64 ?Free@Heap@Details@Platform@@SAXPEAX@Z(ptr) Free
+ @ cdecl -arch=win32 ?FreeException@Heap@Details@Platform@@SAXPAX@Z(ptr) FreeException
+ @ cdecl -arch=win64 ?FreeException@Heap@Details@Platform@@SAXPEAX@Z(ptr) FreeException
+-@ stub -arch=i386 ?GetActivationFactory@Details@Platform@@YGJPAVModuleBase@1WRL@Microsoft@@PAUHSTRING__@@PAPAUIActivationFactory@@@Z
+-@ stub -arch=arm ?GetActivationFactory@Details@Platform@@YAJPAVModuleBase@1WRL@Microsoft@@PAUHSTRING__@@PAPAUIActivationFactory@@@Z
+-@ stub -arch=win64 ?GetActivationFactory@Details@Platform@@YAJPEAVModuleBase@1WRL@Microsoft@@PEAUHSTRING__@@PEAPEAUIActivationFactory@@@Z
++@ stdcall -arch=i386 ?GetActivationFactory@Details@Platform@@YGJPAVModuleBase@1WRL@Microsoft@@PAUHSTRING__@@PAPAUIActivationFactory@@@Z(ptr ptr ptr) Platform_Details_GetActivationFactory
++@ stdcall -arch=arm ?GetActivationFactory@Details@Platform@@YAJPAVModuleBase@1WRL@Microsoft@@PAUHSTRING__@@PAPAUIActivationFactory@@@Z(ptr ptr ptr) Platform_Details_GetActivationFactory
++@ stdcall -arch=win64 ?GetActivationFactory@Details@Platform@@YAJPEAVModuleBase@1WRL@Microsoft@@PEAUHSTRING__@@PEAPEAUIActivationFactory@@@Z(ptr ptr ptr) Platform_Details_GetActivationFactory
+ @ stdcall -arch=i386 ?GetActivationFactoryByPCWSTR@@YGJPAXAAVGuid@Platform@@PAPAX@Z(wstr ptr ptr) GetActivationFactoryByPCWSTR
+ @ stdcall -arch=arm ?GetActivationFactoryByPCWSTR@@YAJPAXAAVGuid@Platform@@PAPAX@Z(wstr ptr ptr) GetActivationFactoryByPCWSTR
+ @ stdcall -arch=win64 ?GetActivationFactoryByPCWSTR@@YAJPEAXAEAVGuid@Platform@@PEAPEAX@Z(wstr ptr ptr) GetActivationFactoryByPCWSTR
+diff --git a/dlls/windows.globalization/main.c b/dlls/windows.globalization/main.c
+index 5902b8f..93454c6 100644
+--- a/dlls/windows.globalization/main.c
++++ b/dlls/windows.globalization/main.c
+@@ -1045,15 +1045,16 @@ DEFINE_IINSPECTABLE(application_languages_statics, IApplicationLanguagesStatics,
+ static HRESULT STDMETHODCALLTYPE application_languages_statics_get_PrimaryLanguageOverride(
+         IApplicationLanguagesStatics *iface, HSTRING *value)
+ {
+-    FIXME("iface %p, value %p stub!\n", iface, value);
+-    return E_NOTIMPL;
++    TRACE("iface %p, value %p\n", iface, value);
++    if (!value) return E_POINTER;
++    return WindowsCreateString(L"", 0, value);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE application_languages_statics_put_PrimaryLanguageOverride(
+         IApplicationLanguagesStatics *iface, HSTRING value)
+ {
+-    FIXME("iface %p, value %s stub!\n", iface, wine_dbgstr_hstring(value));
+-    return E_NOTIMPL;
++    FIXME("iface %p, value %s semi-stub!\n", iface, wine_dbgstr_hstring(value));
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE application_languages_statics_get_Languages(
+diff --git a/dlls/windows.storage.applicationdata/applicationdata.c b/dlls/windows.storage.applicationdata/applicationdata.c
+index dbe42b3..4b2c926 100644
+--- a/dlls/windows.storage.applicationdata/applicationdata.c
++++ b/dlls/windows.storage.applicationdata/applicationdata.c
+@@ -209,34 +209,372 @@ static HRESULT WINAPI application_data_ClearAsync( IApplicationData *iface, Appl
+     return E_NOTIMPL;
+ }
+ 
++struct application_data_container
++{
++    IApplicationDataContainer IApplicationDataContainer_iface;
++    LONG ref;
++    ApplicationDataLocality locality;
++    IPropertySet *values;
++};
++
++static inline struct application_data_container *impl_from_IApplicationDataContainer( IApplicationDataContainer *iface )
++{
++    return CONTAINING_RECORD( iface, struct application_data_container, IApplicationDataContainer_iface );
++}
++
++static HRESULT WINAPI container_QueryInterface( IApplicationDataContainer *iface, REFIID iid, void **out )
++{
++    struct application_data_container *impl = impl_from_IApplicationDataContainer( iface );
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IApplicationDataContainer ))
++    {
++        *out = &impl->IApplicationDataContainer_iface;
++        InterlockedIncrement( &impl->ref );
++        return S_OK;
++    }
++    FIXME( "iid %s not implemented.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI container_AddRef( IApplicationDataContainer *iface )
++{
++    struct application_data_container *impl = impl_from_IApplicationDataContainer( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI container_Release( IApplicationDataContainer *iface )
++{
++    struct application_data_container *impl = impl_from_IApplicationDataContainer( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        if (impl->values) IPropertySet_Release( impl->values );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI container_GetIids( IApplicationDataContainer *iface, ULONG *count, IID **iids )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI container_GetRuntimeClassName( IApplicationDataContainer *iface, HSTRING *name )
++{ return WindowsCreateString( L"Windows.Storage.ApplicationDataContainer", 39, name ); }
++static HRESULT WINAPI container_GetTrustLevel( IApplicationDataContainer *iface, TrustLevel *level )
++{ if (level) *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI container_get_Name( IApplicationDataContainer *iface, HSTRING *value )
++{ return WindowsCreateString( L"LocalSettings", 13, value ); }
++
++static HRESULT WINAPI container_get_Locality( IApplicationDataContainer *iface, ApplicationDataLocality *value )
++{
++    struct application_data_container *impl = impl_from_IApplicationDataContainer( iface );
++    if (!value) return E_POINTER;
++    *value = impl->locality;
++    return S_OK;
++}
++
++static HRESULT WINAPI container_get_Values( IApplicationDataContainer *iface, IPropertySet **value )
++{
++    struct application_data_container *impl = impl_from_IApplicationDataContainer( iface );
++    if (!value) return E_POINTER;
++    if (!impl->values)
++    {
++        static const WCHAR name[] = L"Windows.Foundation.Collections.PropertySet";
++        HSTRING class_id;
++        WindowsCreateString( name, wcslen(name), &class_id );
++        RoActivateInstance( class_id, (IInspectable **)&impl->values );
++        WindowsDeleteString( class_id );
++    }
++    *value = impl->values;
++    if (impl->values) IPropertySet_AddRef( impl->values );
++    return *value ? S_OK : E_FAIL;
++}
++
++static HRESULT WINAPI container_get_Containers( IApplicationDataContainer *iface, IMapView_HSTRING_ApplicationDataContainer **value )
++{
++    FIXME( "stub\n" );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI container_CreateContainer( IApplicationDataContainer *iface, HSTRING name, ApplicationDataCreateDisposition disposition, IApplicationDataContainer **container )
++{
++    FIXME( "stub\n" );
++    if (!container) return E_POINTER;
++    *container = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI container_DeleteContainer( IApplicationDataContainer *iface, HSTRING name )
++{
++    FIXME( "stub\n" );
++    return S_OK;
++}
++
++static const struct IApplicationDataContainerVtbl container_vtbl =
++{
++    container_QueryInterface,
++    container_AddRef,
++    container_Release,
++    container_GetIids,
++    container_GetRuntimeClassName,
++    container_GetTrustLevel,
++    container_get_Name,
++    container_get_Locality,
++    container_get_Values,
++    container_get_Containers,
++    container_CreateContainer,
++    container_DeleteContainer,
++};
++
++static HRESULT container_create( ApplicationDataLocality locality, IApplicationDataContainer **out )
++{
++    struct application_data_container *impl;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IApplicationDataContainer_iface.lpVtbl = &container_vtbl;
++    impl->ref = 1;
++    impl->locality = locality;
++    *out = &impl->IApplicationDataContainer_iface;
++    return S_OK;
++}
++
+ static HRESULT WINAPI application_data_get_LocalSettings( IApplicationData *iface, IApplicationDataContainer **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    static IApplicationDataContainer *local_settings;
++    if (!value) return E_POINTER;
++    if (!local_settings) container_create( ApplicationDataLocality_Local, &local_settings );
++    *value = local_settings;
++    if (local_settings) IApplicationDataContainer_AddRef( local_settings );
++    return *value ? S_OK : E_FAIL;
+ }
+ 
+ static HRESULT WINAPI application_data_get_RoamingSettings( IApplicationData *iface, IApplicationDataContainer **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    static IApplicationDataContainer *roaming_settings;
++    if (!value) return E_POINTER;
++    if (!roaming_settings) container_create( ApplicationDataLocality_Roaming, &roaming_settings );
++    *value = roaming_settings;
++    if (roaming_settings) IApplicationDataContainer_AddRef( roaming_settings );
++    return *value ? S_OK : E_FAIL;
++}
++
++struct storage_folder
++{
++    IStorageFolder IStorageFolder_iface;
++    IStorageItem IStorageItem_iface;
++    LONG ref;
++    WCHAR path[MAX_PATH];
++};
++
++static inline struct storage_folder *impl_from_IStorageFolder( IStorageFolder *iface )
++{
++    return CONTAINING_RECORD( iface, struct storage_folder, IStorageFolder_iface );
++}
++
++static inline struct storage_folder *impl_from_IStorageItem( IStorageItem *iface )
++{
++    return CONTAINING_RECORD( iface, struct storage_folder, IStorageItem_iface );
++}
++
++static HRESULT WINAPI storage_folder_QueryInterface( IStorageFolder *iface, REFIID iid, void **out )
++{
++    struct storage_folder *impl = impl_from_IStorageFolder( iface );
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IStorageFolder ))
++    {
++        *out = &impl->IStorageFolder_iface;
++        InterlockedIncrement( &impl->ref );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IStorageItem ))
++    {
++        *out = &impl->IStorageItem_iface;
++        InterlockedIncrement( &impl->ref );
++        return S_OK;
++    }
++    FIXME( "iid %s not implemented.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI storage_folder_AddRef( IStorageFolder *iface )
++{
++    struct storage_folder *impl = impl_from_IStorageFolder( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI storage_folder_Release( IStorageFolder *iface )
++{
++    struct storage_folder *impl = impl_from_IStorageFolder( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI storage_folder_GetIids( IStorageFolder *iface, ULONG *count, IID **iids )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder_GetRuntimeClassName( IStorageFolder *iface, HSTRING *name )
++{ return WindowsCreateString( L"Windows.Storage.StorageFolder", 29, name ); }
++static HRESULT WINAPI storage_folder_GetTrustLevel( IStorageFolder *iface, TrustLevel *level )
++{ if (level) *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI storage_folder_CreateFileAsyncOverloadDefaultOptions( IStorageFolder *iface, HSTRING name, IAsyncOperation_StorageFile **operation )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder_CreateFileAsync( IStorageFolder *iface, HSTRING name, CreationCollisionOption collision, IAsyncOperation_StorageFile **operation )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder_CreateFolderAsyncOverloadDefaultOptions( IStorageFolder *iface, HSTRING name, IAsyncOperation_StorageFolder **operation )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder_CreateFolderAsync( IStorageFolder *iface, HSTRING name, CreationCollisionOption collision, IAsyncOperation_StorageFolder **operation )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder_GetFileAsync( IStorageFolder *iface, HSTRING name, IAsyncOperation_StorageFile **operation )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder_GetFolderAsync( IStorageFolder *iface, HSTRING name, IAsyncOperation_StorageFolder **operation )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder_GetItemAsync( IStorageFolder *iface, HSTRING name, IAsyncOperation_IStorageItem **operation )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder_GetFilesAsyncOverloadDefaultOptionsStartAndCount( IStorageFolder *iface, IAsyncOperation_IVectorView_StorageFile **operation )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder_GetFoldersAsyncOverloadDefaultOptionsStartAndCount( IStorageFolder *iface, IAsyncOperation_IVectorView_StorageFolder **operation )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder_GetItemsAsyncOverloadDefaultStartAndCount( IStorageFolder *iface, IAsyncOperation_IVectorView_IStorageItem **operation )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++
++static const struct IStorageFolderVtbl storage_folder_vtbl =
++{
++    storage_folder_QueryInterface,
++    storage_folder_AddRef,
++    storage_folder_Release,
++    storage_folder_GetIids,
++    storage_folder_GetRuntimeClassName,
++    storage_folder_GetTrustLevel,
++    storage_folder_CreateFileAsyncOverloadDefaultOptions,
++    storage_folder_CreateFileAsync,
++    storage_folder_CreateFolderAsyncOverloadDefaultOptions,
++    storage_folder_CreateFolderAsync,
++    storage_folder_GetFileAsync,
++    storage_folder_GetFolderAsync,
++    storage_folder_GetItemAsync,
++    storage_folder_GetFilesAsyncOverloadDefaultOptionsStartAndCount,
++    storage_folder_GetFoldersAsyncOverloadDefaultOptionsStartAndCount,
++    storage_folder_GetItemsAsyncOverloadDefaultStartAndCount,
++};
++
++static HRESULT WINAPI storage_item_QueryInterface( IStorageItem *iface, REFIID iid, void **out )
++{
++    struct storage_folder *impl = impl_from_IStorageItem( iface );
++    return IStorageFolder_QueryInterface( &impl->IStorageFolder_iface, iid, out );
++}
++static ULONG WINAPI storage_item_AddRef( IStorageItem *iface )
++{
++    struct storage_folder *impl = impl_from_IStorageItem( iface );
++    return IStorageFolder_AddRef( &impl->IStorageFolder_iface );
++}
++static ULONG WINAPI storage_item_Release( IStorageItem *iface )
++{
++    struct storage_folder *impl = impl_from_IStorageItem( iface );
++    return IStorageFolder_Release( &impl->IStorageFolder_iface );
++}
++static HRESULT WINAPI storage_item_GetIids( IStorageItem *iface, ULONG *count, IID **iids )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_item_GetRuntimeClassName( IStorageItem *iface, HSTRING *name )
++{ return WindowsCreateString( L"Windows.Storage.StorageFolder", 29, name ); }
++static HRESULT WINAPI storage_item_GetTrustLevel( IStorageItem *iface, TrustLevel *level )
++{ if (level) *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI storage_item_RenameAsyncOverloadDefaultOptions( IStorageItem *iface, HSTRING name, IAsyncAction **action )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_item_RenameAsync( IStorageItem *iface, HSTRING name, NameCollisionOption collision, IAsyncAction **action )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_item_DeleteAsyncOverloadDefaultOptions( IStorageItem *iface, IAsyncAction **action )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_item_DeleteAsync( IStorageItem *iface, StorageDeleteOption option, IAsyncAction **action )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_item_GetBasicPropertiesAsync( IStorageItem *iface, IAsyncOperation_BasicProperties **operation )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_item_get_Name( IStorageItem *iface, HSTRING *value )
++{ return WindowsCreateString( L"LocalState", 10, value ); }
++static HRESULT WINAPI storage_item_get_Path( IStorageItem *iface, HSTRING *value )
++{
++    struct storage_folder *impl = impl_from_IStorageItem( iface );
++    return WindowsCreateString( impl->path, wcslen(impl->path), value );
++}
++static HRESULT WINAPI storage_item_get_Attributes( IStorageItem *iface, FileAttributes *value )
++{ if (value) *value = FileAttributes_Directory; return S_OK; }
++static HRESULT WINAPI storage_item_get_DateCreated( IStorageItem *iface, DateTime *value )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI storage_item_IsOfType( IStorageItem *iface, StorageItemTypes type, boolean *value )
++{ if (value) *value = (type == StorageItemTypes_Folder); return S_OK; }
++
++static const struct IStorageItemVtbl storage_item_vtbl =
++{
++    storage_item_QueryInterface,
++    storage_item_AddRef,
++    storage_item_Release,
++    storage_item_GetIids,
++    storage_item_GetRuntimeClassName,
++    storage_item_GetTrustLevel,
++    storage_item_RenameAsyncOverloadDefaultOptions,
++    storage_item_RenameAsync,
++    storage_item_DeleteAsyncOverloadDefaultOptions,
++    storage_item_DeleteAsync,
++    storage_item_GetBasicPropertiesAsync,
++    storage_item_get_Name,
++    storage_item_get_Path,
++    storage_item_get_Attributes,
++    storage_item_get_DateCreated,
++    storage_item_IsOfType,
++};
++
++static HRESULT storage_folder_create( const WCHAR *path, IStorageFolder **out )
++{
++    struct storage_folder *impl;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IStorageFolder_iface.lpVtbl = &storage_folder_vtbl;
++    impl->IStorageItem_iface.lpVtbl = &storage_item_vtbl;
++    impl->ref = 1;
++    lstrcpynW( impl->path, path, ARRAY_SIZE(impl->path) );
++    CreateDirectoryW( impl->path, NULL );
++    *out = &impl->IStorageFolder_iface;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI application_data_get_LocalFolder( IApplicationData *iface, IStorageFolder **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    WCHAR path[MAX_PATH];
++    if (!value) return E_POINTER;
++    if (!GetEnvironmentVariableW( L"LOCALAPPDATA", path, ARRAY_SIZE(path) ))
++    {
++        if (!GetEnvironmentVariableW( L"USERPROFILE", path, ARRAY_SIZE(path) ))
++            return E_FAIL;
++        lstrcatW( path, L"\\AppData\\Local" );
++    }
++    return storage_folder_create( path, value );
+ }
+ 
+ static HRESULT WINAPI application_data_get_RoamingFolder( IApplicationData *iface, IStorageFolder **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    WCHAR path[MAX_PATH];
++    if (!value) return E_POINTER;
++    if (!GetEnvironmentVariableW( L"APPDATA", path, ARRAY_SIZE(path) ))
++    {
++        if (!GetEnvironmentVariableW( L"USERPROFILE", path, ARRAY_SIZE(path) ))
++            return E_FAIL;
++        lstrcatW( path, L"\\AppData\\Roaming" );
++    }
++    return storage_folder_create( path, value );
+ }
+ 
+ static HRESULT WINAPI application_data_get_TemporaryFolder( IApplicationData *iface, IStorageFolder **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    WCHAR path[MAX_PATH];
++    if (!value) return E_POINTER;
++    GetTempPathW( ARRAY_SIZE(path), path );
++    return storage_folder_create( path, value );
+ }
+ 
+ static HRESULT WINAPI application_data_add_DataChanged( IApplicationData *iface, ITypedEventHandler_ApplicationData_IInspectable *handler,
+diff --git a/dlls/windows.storage.applicationdata/private.h b/dlls/windows.storage.applicationdata/private.h
+index 6eebc9b..e4ee58f 100644
+--- a/dlls/windows.storage.applicationdata/private.h
++++ b/dlls/windows.storage.applicationdata/private.h
+@@ -26,8 +26,10 @@
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winstring.h"
++#include "shlobj.h"
+ 
+ #include "activation.h"
++#include "roapi.h"
+ 
+ #define WIDL_using_Windows_Foundation
+ #define WIDL_using_Windows_Foundation_Collections
+diff --git a/dlls/windows.ui/corewindow.c b/dlls/windows.ui/corewindow.c
+index 4e737ce..4737b80 100644
+--- a/dlls/windows.ui/corewindow.c
++++ b/dlls/windows.ui/corewindow.c
+@@ -323,7 +323,8 @@ static HRESULT WINAPI core_window_QueryInterface( ICoreWindow *iface, REFIID iid
+         *out = &impl->ICoreWindow_iface;
+         return S_OK;
+     }
+-    else if (IsEqualGUID( iid, &IID_ICoreWindowInterop ))
++    else if (IsEqualGUID( iid, &IID_ICoreWindowInterop ) ||
++             !memcmp( iid, "\x29\x4a\xd6\x45\x3e\xa6\xb6\x4c\xb4\x98\x57\x81\xd2\x98\xcb\x4f", 16 ))
+     {
+         ICoreWindow_AddRef( &impl->ICoreWindow_iface );
+         *out = &impl->ICoreWindowInterop_iface;
+@@ -547,3 +548,182 @@ ICoreWindow *core_window_create(void)
+     TRACE( "created CoreWindow %p, hwnd %p\n", impl, impl->hwnd );
+     return &impl->ICoreWindow_iface;
+ }
++
++/* ---- Windows.UI.Core.CoreCursor ---- */
++
++struct core_cursor
++{
++    ICoreCursor ICoreCursor_iface;
++    LONG ref;
++    CoreCursorType type;
++    UINT32 id;
++};
++
++static inline struct core_cursor *impl_from_ICoreCursor( ICoreCursor *iface )
++{
++    return CONTAINING_RECORD( iface, struct core_cursor, ICoreCursor_iface );
++}
++
++static HRESULT WINAPI core_cursor_QueryInterface( ICoreCursor *iface, REFIID iid, void **out )
++{
++    struct core_cursor *impl = impl_from_ICoreCursor( iface );
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_ICoreCursor ))
++    {
++        *out = &impl->ICoreCursor_iface;
++        InterlockedIncrement( &impl->ref );
++        return S_OK;
++    }
++    FIXME( "iid %s not implemented.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI core_cursor_AddRef( ICoreCursor *iface )
++{
++    struct core_cursor *impl = impl_from_ICoreCursor( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++static ULONG WINAPI core_cursor_Release( ICoreCursor *iface )
++{
++    struct core_cursor *impl = impl_from_ICoreCursor( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++static HRESULT WINAPI core_cursor_GetIids( ICoreCursor *iface, ULONG *count, IID **iids )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI core_cursor_GetRuntimeClassName( ICoreCursor *iface, HSTRING *name )
++{ return WindowsCreateString( L"Windows.UI.Core.CoreCursor", 26, name ); }
++static HRESULT WINAPI core_cursor_GetTrustLevel( ICoreCursor *iface, TrustLevel *level )
++{ if (level) *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI core_cursor_get_Id( ICoreCursor *iface, UINT32 *value )
++{
++    struct core_cursor *impl = impl_from_ICoreCursor( iface );
++    if (!value) return E_POINTER;
++    *value = impl->id;
++    return S_OK;
++}
++static HRESULT WINAPI core_cursor_get_Type( ICoreCursor *iface, CoreCursorType *value )
++{
++    struct core_cursor *impl = impl_from_ICoreCursor( iface );
++    if (!value) return E_POINTER;
++    *value = impl->type;
++    return S_OK;
++}
++
++static const struct ICoreCursorVtbl core_cursor_vtbl =
++{
++    core_cursor_QueryInterface,
++    core_cursor_AddRef,
++    core_cursor_Release,
++    core_cursor_GetIids,
++    core_cursor_GetRuntimeClassName,
++    core_cursor_GetTrustLevel,
++    core_cursor_get_Id,
++    core_cursor_get_Type,
++};
++
++struct core_cursor_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    ICoreCursorFactory ICoreCursorFactory_iface;
++    LONG ref;
++};
++
++static inline struct core_cursor_factory *impl_from_IActivationFactory_cursor( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct core_cursor_factory, IActivationFactory_iface );
++}
++static inline struct core_cursor_factory *impl_from_ICoreCursorFactory( ICoreCursorFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct core_cursor_factory, ICoreCursorFactory_iface );
++}
++
++static HRESULT WINAPI cursor_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct core_cursor_factory *impl = impl_from_IActivationFactory_cursor( iface );
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = &impl->IActivationFactory_iface;
++        InterlockedIncrement( &impl->ref );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_ICoreCursorFactory ))
++    {
++        *out = &impl->ICoreCursorFactory_iface;
++        InterlockedIncrement( &impl->ref );
++        return S_OK;
++    }
++    FIXME( "iid %s not implemented.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI cursor_factory_AddRef( IActivationFactory *iface )
++{
++    struct core_cursor_factory *impl = impl_from_IActivationFactory_cursor( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++static ULONG WINAPI cursor_factory_Release( IActivationFactory *iface )
++{
++    struct core_cursor_factory *impl = impl_from_IActivationFactory_cursor( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++static HRESULT WINAPI cursor_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++static HRESULT WINAPI cursor_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
++{ return WindowsCreateString( L"Windows.UI.Core.CoreCursor", 26, name ); }
++static HRESULT WINAPI cursor_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{ if (level) *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI cursor_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{ FIXME( "stub\n" ); return E_NOTIMPL; }
++
++static const struct IActivationFactoryVtbl cursor_activation_factory_vtbl =
++{
++    cursor_factory_QueryInterface,
++    cursor_factory_AddRef,
++    cursor_factory_Release,
++    cursor_factory_GetIids,
++    cursor_factory_GetRuntimeClassName,
++    cursor_factory_GetTrustLevel,
++    cursor_factory_ActivateInstance,
++};
++
++static HRESULT WINAPI cursor_factory_CreateCursor( ICoreCursorFactory *iface, CoreCursorType type, UINT32 id, ICoreCursor **cursor )
++{
++    struct core_cursor *impl;
++    TRACE( "iface %p, type %d, id %u, cursor %p\n", iface, type, id, cursor );
++    if (!cursor) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->ICoreCursor_iface.lpVtbl = &core_cursor_vtbl;
++    impl->ref = 1;
++    impl->type = type;
++    impl->id = id;
++    *cursor = &impl->ICoreCursor_iface;
++    return S_OK;
++}
++
++static const struct ICoreCursorFactoryVtbl cursor_factory_vtbl =
++{
++    (void *)cursor_factory_QueryInterface,
++    (void *)cursor_factory_AddRef,
++    (void *)cursor_factory_Release,
++    (void *)cursor_factory_GetIids,
++    (void *)cursor_factory_GetRuntimeClassName,
++    (void *)cursor_factory_GetTrustLevel,
++    cursor_factory_CreateCursor,
++};
++
++static struct core_cursor_factory cursor_factory_obj =
++{
++    {&cursor_activation_factory_vtbl},
++    {&cursor_factory_vtbl},
++    1,
++};
++
++IActivationFactory *core_cursor_factory = &cursor_factory_obj.IActivationFactory_iface;
+diff --git a/dlls/windows.ui/main.c b/dlls/windows.ui/main.c
+index 9c76661..5375c4d 100644
+--- a/dlls/windows.ui/main.c
++++ b/dlls/windows.ui/main.c
+@@ -53,6 +53,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Core_CoreWindow ))
+         IActivationFactory_QueryInterface( corewindow_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    if (!wcscmp( buffer, L"Windows.UI.Core.CoreCursor" ))
++        IActivationFactory_QueryInterface( core_cursor_factory, &IID_IActivationFactory, (void **)factory );
++
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
+diff --git a/dlls/windows.ui/private.h b/dlls/windows.ui/private.h
+index b45b776..0415e86 100644
+--- a/dlls/windows.ui/private.h
++++ b/dlls/windows.ui/private.h
+@@ -43,6 +43,7 @@ extern IActivationFactory *uisettings_factory;
+ extern IActivationFactory *uiviewsettings_factory;
+ extern IActivationFactory *inputpane_factory;
+ extern IActivationFactory *corewindow_factory;
++extern IActivationFactory *core_cursor_factory;
+ extern __x_ABI_CWindows_CUI_CCore_CICoreWindow *core_window_create(void);
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+-- 
+2.56.0
+
