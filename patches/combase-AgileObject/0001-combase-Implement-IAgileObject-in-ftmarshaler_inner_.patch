@@ -1,0 +1,26 @@
+From 06f067f2f166b05dd0d557fa1f5398553126d20d Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Fri, 16 Oct 2026 12:24:04 +0500
+Subject: [PATCH 2/7] combase: Implement IAgileObject in
+ ftmarshaler_inner_QueryInterface
+
+---
+ dlls/combase/marshal.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/dlls/combase/marshal.c b/dlls/combase/marshal.c
+index 6e3d35c..ee7003d 100644
+--- a/dlls/combase/marshal.c
++++ b/dlls/combase/marshal.c
+@@ -181,6 +181,8 @@ static HRESULT WINAPI ftmarshaler_inner_QueryInterface(IUnknown *iface, REFIID r
+         *obj = &marshaler->IUnknown_inner;
+     else if (IsEqualIID(&IID_IMarshal, riid))
+         *obj = &marshaler->IMarshal_iface;
++    else if (IsEqualIID(&IID_IAgileObject, riid))
++        *obj = &marshaler->IUnknown_inner;
+     else
+     {
+         FIXME("No interface for %s\n", debugstr_guid(riid));
+-- 
+2.56.0
+

@@ -1,0 +1,239 @@
+From b56c6098539490a6011a2108cd6ae6d5007b5b4d Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Fri, 16 Oct 2026 12:24:37 +0500
+Subject: [PATCH 6/7] windows.graphics: Implement IDisplayInformation and
+ GetForCurrentView
+
+---
+ dlls/windows.graphics/main.c | 209 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 207 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/windows.graphics/main.c b/dlls/windows.graphics/main.c
+index 25a5719..d3b430a 100644
+--- a/dlls/windows.graphics/main.c
++++ b/dlls/windows.graphics/main.c
+@@ -113,14 +113,219 @@ static const struct IActivationFactoryVtbl factory_vtbl =
+     factory_ActivateInstance,
+ };
+ 
++struct display_information
++{
++    IDisplayInformation IDisplayInformation_iface;
++    IDisplayInformation2 IDisplayInformation2_iface;
++    LONG ref;
++};
++
++static inline struct display_information *impl_from_IDisplayInformation( IDisplayInformation *iface )
++{
++    return CONTAINING_RECORD( iface, struct display_information, IDisplayInformation_iface );
++}
++static inline struct display_information *impl_from_IDisplayInformation2( IDisplayInformation2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct display_information, IDisplayInformation2_iface );
++}
++
++static HRESULT WINAPI display_info_QueryInterface( IDisplayInformation *iface, REFIID iid, void **out )
++{
++    struct display_information *impl = impl_from_IDisplayInformation( iface );
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IDisplayInformation ))
++    {
++        *out = &impl->IDisplayInformation_iface;
++        IDisplayInformation_AddRef( *out );
++        return S_OK;
++    }
++    else if (IsEqualGUID( iid, &IID_IDisplayInformation2 ))
++    {
++        *out = &impl->IDisplayInformation2_iface;
++        IDisplayInformation2_AddRef( *out );
++        return S_OK;
++    }
++    FIXME( "%s not implemented.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI display_info_AddRef( IDisplayInformation *iface )
++{
++    struct display_information *impl = impl_from_IDisplayInformation( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++static ULONG WINAPI display_info_Release( IDisplayInformation *iface )
++{
++    struct display_information *impl = impl_from_IDisplayInformation( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++static HRESULT WINAPI display_info_GetIids( IDisplayInformation *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI display_info_GetRuntimeClassName( IDisplayInformation *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI display_info_GetTrustLevel( IDisplayInformation *iface, TrustLevel *level ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI display_info_get_CurrentOrientation( IDisplayInformation *iface, DisplayOrientations *value )
++{
++    if (value) *value = DisplayOrientations_Landscape;
++    return S_OK;
++}
++static HRESULT WINAPI display_info_get_NativeOrientation( IDisplayInformation *iface, DisplayOrientations *value )
++{
++    if (value) *value = DisplayOrientations_Landscape;
++    return S_OK;
++}
++static HRESULT WINAPI display_info_add_OrientationChanged( IDisplayInformation *iface,
++        ITypedEventHandler_DisplayInformation_IInspectable *h, EventRegistrationToken *t )
++{
++    if (t) t->value = 0;
++    return S_OK;
++}
++static HRESULT WINAPI display_info_remove_OrientationChanged( IDisplayInformation *iface, EventRegistrationToken t )
++{
++    return S_OK;
++}
++static HRESULT WINAPI display_info_get_ResolutionScale( IDisplayInformation *iface, ResolutionScale *value )
++{
++    if (value) *value = ResolutionScale_Scale100Percent;
++    return S_OK;
++}
++static HRESULT WINAPI display_info_get_LogicalDpi( IDisplayInformation *iface, FLOAT *value )
++{
++    if (value) *value = 96.0f;
++    return S_OK;
++}
++static HRESULT WINAPI display_info_get_RawDpiX( IDisplayInformation *iface, FLOAT *value )
++{
++    if (value) *value = 96.0f;
++    return S_OK;
++}
++static HRESULT WINAPI display_info_get_RawDpiY( IDisplayInformation *iface, FLOAT *value )
++{
++    if (value) *value = 96.0f;
++    return S_OK;
++}
++static HRESULT WINAPI display_info_add_DpiChanged( IDisplayInformation *iface,
++        ITypedEventHandler_DisplayInformation_IInspectable *h, EventRegistrationToken *t )
++{
++    if (t) t->value = 0;
++    return S_OK;
++}
++static HRESULT WINAPI display_info_remove_DpiChanged( IDisplayInformation *iface, EventRegistrationToken t )
++{
++    return S_OK;
++}
++static HRESULT WINAPI display_info_get_StereoEnabled( IDisplayInformation *iface, boolean *value )
++{
++    if (value) *value = FALSE;
++    return S_OK;
++}
++static HRESULT WINAPI display_info_add_StereoEnabledChanged( IDisplayInformation *iface,
++        ITypedEventHandler_DisplayInformation_IInspectable *h, EventRegistrationToken *t )
++{
++    if (t) t->value = 0;
++    return S_OK;
++}
++static HRESULT WINAPI display_info_remove_StereoEnabledChanged( IDisplayInformation *iface, EventRegistrationToken t )
++{
++    return S_OK;
++}
++static HRESULT WINAPI display_info_GetColorProfileAsync( IDisplayInformation *iface,
++        IAsyncOperation_IRandomAccessStream **async_info )
++{
++    if (async_info) *async_info = NULL;
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI display_info_add_ColorProfileChanged( IDisplayInformation *iface,
++        ITypedEventHandler_DisplayInformation_IInspectable *h, EventRegistrationToken *t )
++{
++    if (t) t->value = 0;
++    return S_OK;
++}
++static HRESULT WINAPI display_info_remove_ColorProfileChanged( IDisplayInformation *iface, EventRegistrationToken t )
++{
++    return S_OK;
++}
++
++static const struct IDisplayInformationVtbl display_info_vtbl =
++{
++    display_info_QueryInterface,
++    display_info_AddRef,
++    display_info_Release,
++    display_info_GetIids,
++    display_info_GetRuntimeClassName,
++    display_info_GetTrustLevel,
++    display_info_get_CurrentOrientation,
++    display_info_get_NativeOrientation,
++    display_info_add_OrientationChanged,
++    display_info_remove_OrientationChanged,
++    display_info_get_ResolutionScale,
++    display_info_get_LogicalDpi,
++    display_info_get_RawDpiX,
++    display_info_get_RawDpiY,
++    display_info_add_DpiChanged,
++    display_info_remove_DpiChanged,
++    display_info_get_StereoEnabled,
++    display_info_add_StereoEnabledChanged,
++    display_info_remove_StereoEnabledChanged,
++    display_info_GetColorProfileAsync,
++    display_info_add_ColorProfileChanged,
++    display_info_remove_ColorProfileChanged,
++};
++
++static HRESULT WINAPI display_info2_QueryInterface( IDisplayInformation2 *iface, REFIID iid, void **out )
++{
++    struct display_information *impl = impl_from_IDisplayInformation2( iface );
++    return IDisplayInformation_QueryInterface( &impl->IDisplayInformation_iface, iid, out );
++}
++static ULONG WINAPI display_info2_AddRef( IDisplayInformation2 *iface )
++{
++    struct display_information *impl = impl_from_IDisplayInformation2( iface );
++    return IDisplayInformation_AddRef( &impl->IDisplayInformation_iface );
++}
++static ULONG WINAPI display_info2_Release( IDisplayInformation2 *iface )
++{
++    struct display_information *impl = impl_from_IDisplayInformation2( iface );
++    return IDisplayInformation_Release( &impl->IDisplayInformation_iface );
++}
++static HRESULT WINAPI display_info2_GetIids( IDisplayInformation2 *iface, ULONG *c, IID **i ) { return E_NOTIMPL; }
++static HRESULT WINAPI display_info2_GetRuntimeClassName( IDisplayInformation2 *iface, HSTRING *n ) { return E_NOTIMPL; }
++static HRESULT WINAPI display_info2_GetTrustLevel( IDisplayInformation2 *iface, TrustLevel *l ) { return E_NOTIMPL; }
++static HRESULT WINAPI display_info2_get_RawPixelsPerViewPixel( IDisplayInformation2 *iface, DOUBLE *value )
++{
++    if (value) *value = 1.0;
++    return S_OK;
++}
++
++static const struct IDisplayInformation2Vtbl display_info2_vtbl =
++{
++    display_info2_QueryInterface,
++    display_info2_AddRef,
++    display_info2_Release,
++    display_info2_GetIids,
++    display_info2_GetRuntimeClassName,
++    display_info2_GetTrustLevel,
++    display_info2_get_RawPixelsPerViewPixel,
++};
++
+ DEFINE_IINSPECTABLE( display_info_statics, IDisplayInformationStatics, struct display_info_statics,
+                      IActivationFactory_iface )
+ 
+ static HRESULT WINAPI display_info_statics_GetForCurrentView( IDisplayInformationStatics *iface,
+         IDisplayInformation **current )
+ {
+-    FIXME( "iface %p, current %p stub!\n", iface, current );
+-    return E_NOTIMPL;
++    struct display_information *impl;
++    TRACE( "iface %p, current %p.\n", iface, current );
++    if (!current) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IDisplayInformation_iface.lpVtbl = &display_info_vtbl;
++    impl->IDisplayInformation2_iface.lpVtbl = &display_info2_vtbl;
++    impl->ref = 1;
++    *current = &impl->IDisplayInformation_iface;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI display_info_statics_get_AutoRotationPreferences( IDisplayInformationStatics *iface,
+-- 
+2.56.0
+

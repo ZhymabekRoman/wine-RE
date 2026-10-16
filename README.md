@@ -28,7 +28,7 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
 * **Path**: `patches/ntdll-WaitCompletionPacket/`
 * **Target Subsystem**: NTDLL & Wineserver Async Wait Completion Engine & ALPC Message Bus
 * **Depends on**: `ntdll-NtAlpcCreatePort`
-* **Patches (0001–0008)**:
+* **Patches (0001–0009)**:
   * `0001`: Implements `NtCreateWaitCompletionPacket`, `NtAssociateWaitCompletionPacket`, and `NtCancelWaitCompletionPacket` + wineserver completion packet object.
   * `0002`: Emulates Windows kernel ALPC connection handshake behavior expected by `CoreMessagingXP.dll`, status `0x87b2080c`, and flag byte checks at offset `+0x3a`.
   * `0003`: Transports ALPC connection-message payload and `ClientId`.
@@ -37,20 +37,22 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
   * `0006`: Stamps ALPC message `Type` and assigns `MessageId`; fixes send use-after-free.
   * `0007`: Corrects per-message `PortContext` for reply direction.
   * `0008`: Implements `OBJ_OPENIF` named port reuse and correlated synchronous request/reply matching by `MessageId` in wineserver async queue (resolves CoreMessaging in-process registrar collision `0xc0000035` and `CoreUICallReceive` empty parameter decode crash).
+  * `0009`: Server-side multi-connection reply routing by `MessageId` across multiple client connection endpoints on the listening port.
 
 ### 3. `kernelbase-PackageIdentity`
 * **Path**: `patches/kernelbase-PackageIdentity/`
 * **Target Subsystem**: KernelBase / AppModel
-* **Patches (0001–0003)**:
+* **Patches (0001–0004)**:
   * `0001`: Reports package identity parsed from environment variables (`PACKAGE_FAMILY_NAME`, `PACKAGE_FULL_NAME`) for unpackaged / standalone runtime launch.
   * `0002`: Implements `GetCurrentPackageId`, `GetCurrentPackageInfo`, `GetCurrentPackagePath`, and `GetPackagePathByFullName`.
   * `0003`: `AppPolicyGetWindowingModel` returns `AppPolicyWindowingModel_Universal` for packaged apps to bypass AppContainer sandboxing checks in CoreMessaging.
+  * `0004`: Implements `PackageFamilyNameFromFullName` and `PackageFamilyNameFromId` and adds configurable windowing model support (`WINE_WINDOWING_MODEL`).
 
 ### 4. `twinapi-appcore-UWP`
 * **Path**: `patches/twinapi-appcore-UWP/`
 * **Target Subsystem**: `twinapi.appcore.dll`, `windows.ui.dll`, Dispatcher
 * **Depends on**: `kernelbase-PackageIdentity`
-* **Patches (0001–0009)**:
+* **Patches (0001–0010)**:
   * `0001`: Implements `ICoreApplication` interface on CoreApplication factory.
   * `0002`: Implements `CoreApplication.Run` and minimal `CoreApplicationView`.
   * `0003`: Wires `CoreWindow` into `FrameworkView.SetWindow`.
@@ -59,9 +61,34 @@ Developed during native bring-up for **WhatsApp for Windows** (`v2.2620.102.0`, 
   * `0006`: Attribution fix on `static_lifetime_map.c`.
   * `0007`: Adds `ICoreApplicationUnhandledError` to CoreApplication factory.
   * `0008`: Extends `IStaticLifetime` vtable and adds `ICoreApplication2`.
-  * `0009`: Creates `DispatcherQueueController` and `DispatcherQueue` pump before `FrameworkView.Initialize` (allows execution past `Microsoft.UI.Xaml.Application.Start`).
+  * `0009`: Creates `DispatcherQueueController` and `DispatcherQueue` pump before `FrameworkView.Initialize`.
+  * `0010`: Implements real Win32 `HWND` backing for `CoreWindow`, `ICoreWindowInterop` (`45d64a29-a63e-4cb6-b498-5781d297cb98`), `ShowWindow(SW_SHOW)`, and UWP `IActivatedEventArgs` launch event dispatch.
 
-### 5. `dcomp-DCompositionCreateDevice2`
+### 5. `combase-AgileObject`
+* **Path**: `patches/combase-AgileObject/`
+* **Target Subsystem**: COMBase Free-Threaded Marshaler
+* **Patches (0001)**:
+  * `0001`: Implements `IID_IAgileObject` (`94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90`) in `ftmarshaler_inner_QueryInterface`.
+
+### 6. `coremessaging-DispatcherQueue`
+* **Path**: `patches/coremessaging-DispatcherQueue/`
+* **Target Subsystem**: `coremessaging.dll`
+* **Patches (0001)**:
+  * `0001`: Implements `IDispatcherQueue` and `IDispatcherQueue2` (`CreateTimer`, `TryEnqueue`, `get_HasThreadAccess`), wires `dispatcher_queue_controller_get_DispatcherQueue`, and implements `CoreUICreate`.
+
+### 7. `windows.graphics-DisplayInformation`
+* **Path**: `patches/windows.graphics-DisplayInformation/`
+* **Target Subsystem**: `windows.graphics.dll`
+* **Patches (0001)**:
+  * `0001`: Implements `IDisplayInformation` and `IDisplayInformation2` (DPI 96, Scale 100%, Landscape, 1.0 raw pixels) and wires `DisplayInformation.GetForCurrentView`.
+
+### 8. `profapi-UserToken`
+* **Path**: `patches/profapi-UserToken/`
+* **Target Subsystem**: `profapi.dll`
+* **Patches (0001)**:
+  * `0001`: Implements ordinal 114 user profile token stub returning `ERROR_SUCCESS`.
+
+### 9. `dcomp-DCompositionCreateDevice2`
 * **Path**: `patches/dcomp-DCompositionCreateDevice2/`
 * **Target Subsystem**: DirectComposition (`dcomp.dll`), `dxgi`
 * **Patches (0001–0067)**:
@@ -79,7 +106,11 @@ Using Wine Staging `patchinstall.py`:
 ./staging/patchinstall.py DESTDIR="/path/to/wine" \
     ntdll-NtAlpcCreatePort \
     ntdll-WaitCompletionPacket \
+    combase-AgileObject \
+    coremessaging-DispatcherQueue \
     kernelbase-PackageIdentity \
+    profapi-UserToken \
+    windows.graphics-DisplayInformation \
     twinapi-appcore-UWP \
     dcomp-DCompositionCreateDevice2
 ```

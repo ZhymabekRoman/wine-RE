@@ -1,0 +1,129 @@
+From cdc0f03752f836e4f2ec46180dca4a04c2153166 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Fri, 16 Oct 2026 12:24:22 +0500
+Subject: [PATCH 4/7] kernelbase: Implement PackageFamilyNameFromFullName and
+ support ClassicDesktop windowing model
+
+---
+ dlls/kernelbase/kernelbase.spec |  4 +-
+ dlls/kernelbase/main.c          |  7 ++--
+ dlls/kernelbase/version.c       | 73 +++++++++++++++++++++++++++++++++
+ 3 files changed, 79 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/kernelbase/kernelbase.spec b/dlls/kernelbase/kernelbase.spec
+index 2c5906a..8749f43 100644
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -1049,8 +1049,8 @@
+ @ stdcall OutputDebugStringA(str)
+ @ stdcall OutputDebugStringW(wstr)
+ # @ stub OverrideRoamingDataModificationTimesInRange
+-# @ stub PackageFamilyNameFromFullName
+-# @ stub PackageFamilyNameFromId
++@ stdcall PackageFamilyNameFromFullName(wstr ptr ptr)
++@ stdcall PackageFamilyNameFromId(ptr ptr ptr)
+ # @ stub PackageFamilyNameFromProductId
+ # @ stub PackageFullNameFromId
+ # @ stub PackageFullNameFromProductId
+diff --git a/dlls/kernelbase/main.c b/dlls/kernelbase/main.c
+index 06e1053..d0faacf 100644
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -148,9 +148,10 @@ LONG WINAPI AppPolicyGetWindowingModel(HANDLE token, AppPolicyWindowingModel *po
+     if(!policy)
+         return ERROR_INVALID_PARAMETER;
+ 
+-    /* A packaged app gets the Universal windowing model; classic desktop only
+-     * for non-packaged processes. Detect package context via the env marker. */
+-    if (GetEnvironmentVariableW( L"WINE_PACKAGE_FULL_NAME", buf, ARRAY_SIZE(buf) ))
++    /* WinUI 3 / WASDK FullTrust applications require the ClassicDesktop windowing model;
++     * Universal (UWP) triggers "WinUI: Error creating an UWP Window. Creating an UWP window is not allowed."
++     * Allow override via WINE_WINDOWING_MODEL env var if needed. */
++    if (GetEnvironmentVariableW( L"WINE_WINDOWING_MODEL", buf, ARRAY_SIZE(buf) ) && !wcsicmp( buf, L"Universal" ))
+         *policy = AppPolicyWindowingModel_Universal;
+     else
+         *policy = AppPolicyWindowingModel_ClassicDesktop;
+diff --git a/dlls/kernelbase/version.c b/dlls/kernelbase/version.c
+index b727d90..72a2899 100644
+--- a/dlls/kernelbase/version.c
++++ b/dlls/kernelbase/version.c
+@@ -1879,3 +1879,76 @@ LONG WINAPI PackageIdFromFullName(const WCHAR *full_name, UINT32 flags, UINT32 *
+ 
+     return ERROR_SUCCESS;
+ }
++
++/***********************************************************************
++ *         PackageFamilyNameFromFullName   (kernelbase.@)
++ */
++LONG WINAPI PackageFamilyNameFromFullName(const WCHAR *full_name, UINT32 *length, WCHAR *family_name)
++{
++    const WCHAR *name, *version_str, *arch_str, *resource_id, *publisher_id;
++    UINT32 name_len, pub_len, needed;
++
++    TRACE("full_name %s, length %p, family_name %p.\n", debugstr_w(full_name), length, family_name);
++
++    if (!full_name || !length)
++        return ERROR_INVALID_PARAMETER;
++
++    name = full_name;
++    if (!(version_str = wcschr(name, L'_')))
++        return ERROR_INVALID_PARAMETER;
++
++    if (!(arch_str = wcschr(version_str + 1, L'_')))
++        return ERROR_INVALID_PARAMETER;
++
++    if (!(resource_id = wcschr(arch_str + 1, L'_')))
++        return ERROR_INVALID_PARAMETER;
++
++    if (!(publisher_id = wcschr(resource_id + 1, L'_')))
++        return ERROR_INVALID_PARAMETER;
++    ++publisher_id;
++
++    name_len = version_str - name;
++    pub_len = wcslen(publisher_id);
++    needed = name_len + 1 + pub_len + 1;
++
++    if (!family_name || *length < needed)
++    {
++        *length = needed;
++        return ERROR_INSUFFICIENT_BUFFER;
++    }
++
++    memcpy(family_name, name, name_len * sizeof(WCHAR));
++    family_name[name_len] = L'_';
++    memcpy(family_name + name_len + 1, publisher_id, (pub_len + 1) * sizeof(WCHAR));
++    *length = needed;
++    return ERROR_SUCCESS;
++}
++
++/***********************************************************************
++ *         PackageFamilyNameFromId   (kernelbase.@)
++ */
++LONG WINAPI PackageFamilyNameFromId(const PACKAGE_ID *id, UINT32 *length, WCHAR *family_name)
++{
++    UINT32 name_len, pub_len, needed;
++
++    TRACE("id %p, length %p, family_name %p.\n", id, length, family_name);
++
++    if (!id || !id->name || !id->publisherId || !length)
++        return ERROR_INVALID_PARAMETER;
++
++    name_len = wcslen(id->name);
++    pub_len = wcslen(id->publisherId);
++    needed = name_len + 1 + pub_len + 1;
++
++    if (!family_name || *length < needed)
++    {
++        *length = needed;
++        return ERROR_INSUFFICIENT_BUFFER;
++    }
++
++    memcpy(family_name, id->name, name_len * sizeof(WCHAR));
++    family_name[name_len] = L'_';
++    memcpy(family_name + name_len + 1, id->publisherId, (pub_len + 1) * sizeof(WCHAR));
++    *length = needed;
++    return ERROR_SUCCESS;
++}
+-- 
+2.56.0
+

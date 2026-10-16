@@ -1,0 +1,74 @@
+From 56c4a680402e06d74ff163616f9ee98049ab119e Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Fri, 16 Oct 2026 12:24:29 +0500
+Subject: [PATCH 5/7] profapi: Implement ordinal 114 stub
+
+---
+ dlls/profapi/Makefile.in  |  2 ++
+ dlls/profapi/main.c       | 32 ++++++++++++++++++++++++++++++++
+ dlls/profapi/profapi.spec |  2 +-
+ 3 files changed, 35 insertions(+), 1 deletion(-)
+ create mode 100644 dlls/profapi/main.c
+
+diff --git a/dlls/profapi/Makefile.in b/dlls/profapi/Makefile.in
+index 726f575..d89c8fc 100644
+--- a/dlls/profapi/Makefile.in
++++ b/dlls/profapi/Makefile.in
+@@ -1 +1,3 @@
+ MODULE    = profapi.dll
++SOURCES = \
++	main.c
+diff --git a/dlls/profapi/main.c b/dlls/profapi/main.c
+new file mode 100644
+index 0000000..aab7491
+--- /dev/null
++++ b/dlls/profapi/main.c
+@@ -0,0 +1,32 @@
++/*
++ * User Profile Basic API (profapi.dll)
++ *
++ * Copyright 2026 Zhymabek Roman
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include "windef.h"
++#include "winbase.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(profapi);
++
++DWORD WINAPI profapi_114( void *a1, void *a2, void *a3, void *a4, void *a5 )
++{
++    FIXME( "(%p, %p, %p, %p, %p) stub!\n", a1, a2, a3, a4, a5 );
++    return ERROR_SUCCESS;
++}
+diff --git a/dlls/profapi/profapi.spec b/dlls/profapi/profapi.spec
+index 529aaac..0d03d78 100644
+--- a/dlls/profapi/profapi.spec
++++ b/dlls/profapi/profapi.spec
+@@ -11,7 +11,7 @@
+ 111 stub -noname @
+ 112 stub -noname @
+ 113 stub -noname @
+-114 stub -noname @
++114 stdcall -noname profapi_114(ptr ptr ptr ptr ptr)
+ 115 stub -noname @
+ 116 stub -noname @
+ 117 stub -noname @
+-- 
+2.56.0
+

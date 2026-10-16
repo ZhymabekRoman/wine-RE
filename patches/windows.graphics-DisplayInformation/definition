@@ -1,0 +1,2 @@
+Fixes: [WinUI3] Implement IDisplayInformation and DisplayInformation.GetForCurrentView
+#Depends:

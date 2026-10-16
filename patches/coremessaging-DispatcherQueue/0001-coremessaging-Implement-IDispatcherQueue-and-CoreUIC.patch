@@ -1,0 +1,301 @@
+From 9dfe238449b436567792da04fe2e94a8d4a1f589 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Fri, 16 Oct 2026 12:24:11 +0500
+Subject: [PATCH 3/7] coremessaging: Implement IDispatcherQueue and
+ CoreUICreate
+
+---
+ dlls/coremessaging/coremessaging.spec |   2 +-
+ dlls/coremessaging/main.c             | 235 +++++++++++++++++++++++++-
+ 2 files changed, 231 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/coremessaging/coremessaging.spec b/dlls/coremessaging/coremessaging.spec
+index fb98c80..3bc2c0e 100644
+--- a/dlls/coremessaging/coremessaging.spec
++++ b/dlls/coremessaging/coremessaging.spec
+@@ -8,7 +8,7 @@
+ @ stub CoreUICallSendVaList
+ @ stub CoreUIConfigureTestHost
+ @ stub CoreUIConfigureUserIntegration
+-@ stub CoreUICreate
++@ stdcall CoreUICreate(ptr)
+ @ stub CoreUICreateAnonymousStream
+ @ stub CoreUICreateEx
+ @ stub CoreUIInitializeTestService
+diff --git a/dlls/coremessaging/main.c b/dlls/coremessaging/main.c
+index 6fa2e28..471f38c 100644
+--- a/dlls/coremessaging/main.c
++++ b/dlls/coremessaging/main.c
+@@ -116,9 +116,166 @@ static const struct IActivationFactoryVtbl factory_vtbl =
+     factory_ActivateInstance,
+ };
+ 
++struct dispatcher_queue
++{
++    IDispatcherQueue IDispatcherQueue_iface;
++    IDispatcherQueue2 IDispatcherQueue2_iface;
++    LONG ref;
++};
++
++static inline struct dispatcher_queue *impl_from_IDispatcherQueue( IDispatcherQueue *iface )
++{
++    return CONTAINING_RECORD( iface, struct dispatcher_queue, IDispatcherQueue_iface );
++}
++static inline struct dispatcher_queue *impl_from_IDispatcherQueue2( IDispatcherQueue2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct dispatcher_queue, IDispatcherQueue2_iface );
++}
++
++static HRESULT WINAPI dispatcher_queue_QueryInterface( IDispatcherQueue *iface, REFIID iid, void **out )
++{
++    struct dispatcher_queue *impl = impl_from_IDispatcherQueue( iface );
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IDispatcherQueue ))
++    {
++        *out = &impl->IDispatcherQueue_iface;
++        IDispatcherQueue_AddRef( *out );
++        return S_OK;
++    }
++    else if (IsEqualGUID( iid, &IID_IDispatcherQueue2 ))
++    {
++        *out = &impl->IDispatcherQueue2_iface;
++        IDispatcherQueue2_AddRef( *out );
++        return S_OK;
++    }
++    FIXME( "%s not implemented.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI dispatcher_queue_AddRef( IDispatcherQueue *iface )
++{
++    struct dispatcher_queue *impl = impl_from_IDispatcherQueue( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++static ULONG WINAPI dispatcher_queue_Release( IDispatcherQueue *iface )
++{
++    struct dispatcher_queue *impl = impl_from_IDispatcherQueue( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++static HRESULT WINAPI dispatcher_queue_GetIids( IDispatcherQueue *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI dispatcher_queue_GetRuntimeClassName( IDispatcherQueue *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI dispatcher_queue_GetTrustLevel( IDispatcherQueue *iface, TrustLevel *level ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI dispatcher_queue_CreateTimer( IDispatcherQueue *iface, IDispatcherQueueTimer **result )
++{
++    FIXME( "stub\n" );
++    if (result) *result = NULL;
++    return S_OK;
++}
++static HRESULT WINAPI dispatcher_queue_TryEnqueue( IDispatcherQueue *iface, IDispatcherQueueHandler *callback, boolean *result )
++{
++    if (result) *result = TRUE;
++    if (callback) IDispatcherQueueHandler_Invoke( callback );
++    return S_OK;
++}
++static HRESULT WINAPI dispatcher_queue_TryEnqueueWithPriority( IDispatcherQueue *iface, DispatcherQueuePriority priority,
++        IDispatcherQueueHandler *callback, boolean *result )
++{
++    if (result) *result = TRUE;
++    if (callback) IDispatcherQueueHandler_Invoke( callback );
++    return S_OK;
++}
++static HRESULT WINAPI dispatcher_queue_add_ShutdownStarting( IDispatcherQueue *iface,
++        ITypedEventHandler_DispatcherQueue_DispatcherQueueShutdownStartingEventArgs *handler, EventRegistrationToken *token )
++{
++    if (token) token->value = 0;
++    return S_OK;
++}
++static HRESULT WINAPI dispatcher_queue_remove_ShutdownStarting( IDispatcherQueue *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++static HRESULT WINAPI dispatcher_queue_add_ShutdownCompleted( IDispatcherQueue *iface,
++        ITypedEventHandler_DispatcherQueue_IInspectable *handler, EventRegistrationToken *token )
++{
++    if (token) token->value = 0;
++    return S_OK;
++}
++static HRESULT WINAPI dispatcher_queue_remove_ShutdownCompleted( IDispatcherQueue *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static const struct IDispatcherQueueVtbl dispatcher_queue_vtbl =
++{
++    dispatcher_queue_QueryInterface,
++    dispatcher_queue_AddRef,
++    dispatcher_queue_Release,
++    dispatcher_queue_GetIids,
++    dispatcher_queue_GetRuntimeClassName,
++    dispatcher_queue_GetTrustLevel,
++    dispatcher_queue_CreateTimer,
++    dispatcher_queue_TryEnqueue,
++    dispatcher_queue_TryEnqueueWithPriority,
++    dispatcher_queue_add_ShutdownStarting,
++    dispatcher_queue_remove_ShutdownStarting,
++    dispatcher_queue_add_ShutdownCompleted,
++    dispatcher_queue_remove_ShutdownCompleted,
++};
++
++static HRESULT WINAPI dispatcher_queue2_QueryInterface( IDispatcherQueue2 *iface, REFIID iid, void **out )
++{
++    struct dispatcher_queue *impl = impl_from_IDispatcherQueue2( iface );
++    return IDispatcherQueue_QueryInterface( &impl->IDispatcherQueue_iface, iid, out );
++}
++static ULONG WINAPI dispatcher_queue2_AddRef( IDispatcherQueue2 *iface )
++{
++    struct dispatcher_queue *impl = impl_from_IDispatcherQueue2( iface );
++    return IDispatcherQueue_AddRef( &impl->IDispatcherQueue_iface );
++}
++static ULONG WINAPI dispatcher_queue2_Release( IDispatcherQueue2 *iface )
++{
++    struct dispatcher_queue *impl = impl_from_IDispatcherQueue2( iface );
++    return IDispatcherQueue_Release( &impl->IDispatcherQueue_iface );
++}
++static HRESULT WINAPI dispatcher_queue2_GetIids( IDispatcherQueue2 *iface, ULONG *c, IID **i ) { return E_NOTIMPL; }
++static HRESULT WINAPI dispatcher_queue2_GetRuntimeClassName( IDispatcherQueue2 *iface, HSTRING *n ) { return E_NOTIMPL; }
++static HRESULT WINAPI dispatcher_queue2_GetTrustLevel( IDispatcherQueue2 *iface, TrustLevel *l ) { return E_NOTIMPL; }
++static HRESULT WINAPI dispatcher_queue2_get_HasThreadAccess( IDispatcherQueue2 *iface, boolean *value )
++{
++    if (value) *value = TRUE;
++    return S_OK;
++}
++
++static const struct IDispatcherQueue2Vtbl dispatcher_queue2_vtbl =
++{
++    dispatcher_queue2_QueryInterface,
++    dispatcher_queue2_AddRef,
++    dispatcher_queue2_Release,
++    dispatcher_queue2_GetIids,
++    dispatcher_queue2_GetRuntimeClassName,
++    dispatcher_queue2_GetTrustLevel,
++    dispatcher_queue2_get_HasThreadAccess,
++};
++
++static IDispatcherQueue *dispatcher_queue_create(void)
++{
++    struct dispatcher_queue *impl;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->IDispatcherQueue_iface.lpVtbl = &dispatcher_queue_vtbl;
++    impl->IDispatcherQueue2_iface.lpVtbl = &dispatcher_queue2_vtbl;
++    impl->ref = 1;
++    return &impl->IDispatcherQueue_iface;
++}
++
+ struct dispatcher_queue_controller
+ {
+     IDispatcherQueueController IDispatcherQueueController_iface;
++    IDispatcherQueue *queue;
+     LONG ref;
+ };
+ 
+@@ -163,7 +320,11 @@ static ULONG WINAPI dispatcher_queue_controller_Release( IDispatcherQueueControl
+ 
+     TRACE( "iface %p decreasing ref to %lu.\n", iface, ref );
+ 
+-    if (!ref) free( impl );
++    if (!ref)
++    {
++        if (impl->queue) IDispatcherQueue_Release( impl->queue );
++        free( impl );
++    }
+     return ref;
+ }
+ 
+@@ -187,8 +348,13 @@ static HRESULT WINAPI dispatcher_queue_controller_GetTrustLevel( IDispatcherQueu
+ 
+ static HRESULT WINAPI dispatcher_queue_controller_get_DispatcherQueue( IDispatcherQueueController *iface, IDispatcherQueue **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct dispatcher_queue_controller *impl = impl_from_IDispatcherQueueController( iface );
++    TRACE( "iface %p, value %p\n", iface, value );
++    if (!value) return E_POINTER;
++    if (!impl->queue) impl->queue = dispatcher_queue_create();
++    if (impl->queue) IDispatcherQueue_AddRef( impl->queue );
++    *value = impl->queue;
++    return *value ? S_OK : E_OUTOFMEMORY;
+ }
+ 
+ static HRESULT shutdown_queue_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+@@ -225,8 +391,9 @@ DEFINE_IINSPECTABLE( dispatcher_queue_controller_statics, IDispatcherQueueContro
+ 
+ static HRESULT WINAPI dispatcher_queue_controller_statics_CreateOnDedicatedThread( IDispatcherQueueControllerStatics *iface, IDispatcherQueueController **result )
+ {
+-    FIXME( "iface %p, result %p stub!\n", iface, result );
+-    return E_NOTIMPL;
++    DispatcherQueueOptions opts = { sizeof(opts), DQTYPE_THREAD_DEDICATED, DQTAT_COM_NONE };
++    TRACE( "iface %p, result %p\n", iface, result );
++    return CreateDispatcherQueueController( opts, (PDISPATCHERQUEUECONTROLLER *)result );
+ }
+ 
+ static const struct IDispatcherQueueControllerStaticsVtbl dispatcher_queue_controller_statics_vtbl =
+@@ -285,3 +452,61 @@ HRESULT WINAPI CreateDispatcherQueueController( DispatcherQueueOptions options,
+     TRACE( "created IDispatcherQueueController %p.\n", *queue_controller );
+     return S_OK;
+ }
++
++struct core_ui
++{
++    IUnknown IUnknown_iface;
++    LONG ref;
++};
++
++static inline struct core_ui *impl_from_IUnknown( IUnknown *iface )
++{
++    return CONTAINING_RECORD( iface, struct core_ui, IUnknown_iface );
++}
++
++static HRESULT WINAPI core_ui_QueryInterface( IUnknown *iface, REFIID iid, void **out )
++{
++    struct core_ui *impl = impl_from_IUnknown( iface );
++    if (IsEqualGUID( iid, &IID_IUnknown ))
++    {
++        InterlockedIncrement( &impl->ref );
++        *out = &impl->IUnknown_iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI core_ui_AddRef( IUnknown *iface )
++{
++    struct core_ui *impl = impl_from_IUnknown( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI core_ui_Release( IUnknown *iface )
++{
++    struct core_ui *impl = impl_from_IUnknown( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static const struct IUnknownVtbl core_ui_vtbl =
++{
++    core_ui_QueryInterface,
++    core_ui_AddRef,
++    core_ui_Release,
++};
++
++HRESULT WINAPI CoreUICreate( void **out )
++{
++    struct core_ui *impl;
++    TRACE( "out %p\n", out );
++    if (!out) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IUnknown_iface.lpVtbl = &core_ui_vtbl;
++    impl->ref = 1;
++    *out = &impl->IUnknown_iface;
++    return S_OK;
++}
+-- 
+2.56.0
+

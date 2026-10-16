@@ -1,0 +1,2 @@
+Fixes: [WinRT] Implement IAgileObject in free-threaded marshaler (ftmarshaler)
+#Depends:
