@@ -122,4 +122,4 @@ Using Wine Staging `patchinstall.py`:
 * **Current Base**: Synced to Wine-Staging `v11.19` (`11dd86bd`)
 * **Upstream Wine**: `https://gitlab.winehq.org/wine/wine.git`
 * **Wine-Staging**: `https://gitlab.winehq.org/wine/wine-staging.git`
-* **GitHub**: `https://github.com/ZhymabekRoman/wine-RE`
+* **GitHub**: `https://github.com/ZhymabekRoman/wine-ultimate`
