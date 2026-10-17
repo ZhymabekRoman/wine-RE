@@ -1,0 +1,202 @@
+From 2350d41c8eaf666e32b9b11b0be40eac134ec0c8 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Sat, 17 Oct 2026 18:47:04 +0500
+Subject: [PATCH] dcomp, storage, ui, ntdll: Fix compositor clock, empty
+ container map view, CoreWindow CS_OWNDC, and SEH logging
+
+---
+ dlls/dcomp/device.c                           | 17 +++--
+ dlls/ntdll/unix/thread.c                      | 14 +++-
+ .../applicationdata.c                         | 65 ++++++++++++++++++-
+ dlls/windows.ui/corewindow.c                  | 10 +++
+ 4 files changed, 98 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/dcomp/device.c b/dlls/dcomp/device.c
+index a2853c6..56544cc 100644
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -78,14 +78,14 @@ static HRESULT STDMETHODCALLTYPE device_QueryInterface(IDCompositionDevice *ifac
+                   || IsEqualGUID(iid, &IID_IDCompositionDesktopDevice)))
+               || IsEqualGUID(iid, &IID_IDCompositionDesktopDevicePartner)
+               || IsEqualGUID(iid, &IID_IDCompositionDeviceUnknown)
+-              || !memcmp(iid, "\x68\x69\x55\x6b\x25\x2d\xe2\x11\x99\xf6\x8b\xc3\x60\x88\x70\x9b", 16))
++              || !memcmp(iid, "\x8d\x46\xf6\x75\x8e\x1b\x7c\x44\x9b\xc6\x75\xfe\xa8\x0b\x5b\x25", 16))
+     {
+         IUnknown_AddRef(&device->IDCompositionDeviceUnknown_iface);
+         *out = &device->IDCompositionDeviceUnknown_iface;
+ 
+         if (IsEqualGUID(iid, &IID_IDCompositionDesktopDevicePartner)
+             || IsEqualGUID(iid, &IID_IDCompositionDeviceUnknown)
+-            || !memcmp(iid, "\x68\x69\x55\x6b\x25\x2d\xe2\x11\x99\xf6\x8b\xc3\x60\x88\x70\x9b", 16))
++            || !memcmp(iid, "\x8d\x46\xf6\x75\x8e\x1b\x7c\x44\x9b\xc6\x75\xfe\xa8\x0b\x5b\x25", 16))
+             FIXME("Returning undocumented interface %s %p.\n", wine_dbgstr_guid(iid), *out);
+         return S_OK;
+     }
+@@ -2152,9 +2152,13 @@ HRESULT WINAPI DCompPrivates_CreateCompositionBatchQuery(IDCompositionDevice *de
+     return S_OK;
+ }
+ 
++static HANDLE g_commit_completion_event = NULL;
++
+ HRESULT WINAPI DCompPrivates_SetCommitCompletionEvent(IDCompositionDevice *device, HANDLE event)
+ {
+     ERR("(%p, %p)\n", device, event);
++    g_commit_completion_event = event;
++    if (event) SetEvent(event);
+     return S_OK;
+ }
+ 
+@@ -2162,7 +2166,12 @@ DWORD WINAPI DCompositionWaitForCompositorClock(UINT count, const HANDLE *handle
+ {
+     TRACE("(%u, %p, %lu)\n", count, handles, timeout);
+     if (count && handles)
+-        return WaitForMultipleObjects(count, handles, FALSE, timeout);
++    {
++        DWORD ret = WaitForMultipleObjects(count, handles, FALSE, timeout < 16 ? timeout : 16);
++        if (ret != WAIT_TIMEOUT) return ret;
++    }
++    if (g_commit_completion_event)
++        SetEvent(g_commit_completion_event);
+     Sleep(timeout < 16 ? timeout : 16);
+-    return WAIT_TIMEOUT;
++    return WAIT_OBJECT_0;
+ }
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 4063a79..4e87548 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1648,8 +1648,18 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL
+         return NtContinue( context, FALSE );
+ 
+     if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION && context)
+-        ERR_(seh)("FIRST_CHANCE_AV addr %p rip=%p rsp=%p\n",
+-                  rec->ExceptionAddress, (void *)context->Rip, (void *)context->Rsp);
++    {
++        ULONG64 *sp = (ULONG64 *)context->Rsp;
++        int i;
++        ERR_(seh)("FIRST_CHANCE_AV addr %p rip=%p rsp=%p rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx rsi=%016llx rdi=%016llx r8=%016llx r9=%016llx\n",
++                  rec->ExceptionAddress, (void *)context->Rip, (void *)context->Rsp,
++                  (unsigned long long)context->Rax, (unsigned long long)context->Rbx,
++                  (unsigned long long)context->Rcx, (unsigned long long)context->Rdx,
++                  (unsigned long long)context->Rsi, (unsigned long long)context->Rdi,
++                  (unsigned long long)context->R8, (unsigned long long)context->R9);
++        for (i = 0; i < 16; i++)
++            ERR_(seh)("  av_stack[%02d] (%p) = %016llx\n", i, sp + i, sp[i]);
++    }
+ 
+     if (first_chance) return call_user_exception_dispatcher( data, rec, context );
+ 
+diff --git a/dlls/windows.storage.applicationdata/applicationdata.c b/dlls/windows.storage.applicationdata/applicationdata.c
+index 65cfa14..afff46a 100644
+--- a/dlls/windows.storage.applicationdata/applicationdata.c
++++ b/dlls/windows.storage.applicationdata/applicationdata.c
+@@ -305,11 +305,72 @@ static HRESULT WINAPI container_get_Values( IApplicationDataContainer *iface, IP
+     return *value ? S_OK : E_FAIL;
+ }
+ 
++static HRESULT WINAPI empty_map_view_QueryInterface( IMapView_HSTRING_ApplicationDataContainer *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IMapView_HSTRING_ApplicationDataContainer ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI empty_map_view_AddRef( IMapView_HSTRING_ApplicationDataContainer *iface ) { return 2; }
++static ULONG WINAPI empty_map_view_Release( IMapView_HSTRING_ApplicationDataContainer *iface ) { return 1; }
++static HRESULT WINAPI empty_map_view_GetIids( IMapView_HSTRING_ApplicationDataContainer *iface, ULONG *c, IID **i ) { return E_NOTIMPL; }
++static HRESULT WINAPI empty_map_view_GetRuntimeClassName( IMapView_HSTRING_ApplicationDataContainer *iface, HSTRING *n )
++{
++    return WindowsCreateString( L"Windows.Foundation.Collections.IMapView`2", 40, n );
++}
++static HRESULT WINAPI empty_map_view_GetTrustLevel( IMapView_HSTRING_ApplicationDataContainer *iface, TrustLevel *l )
++{
++    if (l) *l = BaseTrust; return S_OK;
++}
++static HRESULT WINAPI empty_map_view_Lookup( IMapView_HSTRING_ApplicationDataContainer *iface, HSTRING key, IApplicationDataContainer **value )
++{
++    if (value) *value = NULL;
++    return 0x8000000b; /* E_BOUNDS */
++}
++static HRESULT WINAPI empty_map_view_get_Size( IMapView_HSTRING_ApplicationDataContainer *iface, unsigned int *size )
++{
++    if (size) *size = 0;
++    return S_OK;
++}
++static HRESULT WINAPI empty_map_view_HasKey( IMapView_HSTRING_ApplicationDataContainer *iface, HSTRING key, boolean *found )
++{
++    if (found) *found = FALSE;
++    return S_OK;
++}
++static HRESULT WINAPI empty_map_view_Split( IMapView_HSTRING_ApplicationDataContainer *iface, IMapView_HSTRING_ApplicationDataContainer **first, IMapView_HSTRING_ApplicationDataContainer **second )
++{
++    if (first) *first = NULL;
++    if (second) *second = NULL;
++    return S_OK;
++}
++
++static const struct __FIMapView_2_HSTRING_Windows__CStorage__CApplicationDataContainerVtbl empty_map_view_vtbl =
++{
++    empty_map_view_QueryInterface,
++    empty_map_view_AddRef,
++    empty_map_view_Release,
++    empty_map_view_GetIids,
++    empty_map_view_GetRuntimeClassName,
++    empty_map_view_GetTrustLevel,
++    empty_map_view_Lookup,
++    empty_map_view_get_Size,
++    empty_map_view_HasKey,
++    empty_map_view_Split,
++};
++
++static IMapView_HSTRING_ApplicationDataContainer empty_map_view = { (void *)&empty_map_view_vtbl };
++
+ static HRESULT WINAPI container_get_Containers( IApplicationDataContainer *iface, IMapView_HSTRING_ApplicationDataContainer **value )
+ {
+-    FIXME( "stub\n" );
++    TRACE( "iface %p, value %p\n", iface, value );
+     if (!value) return E_POINTER;
+-    *value = NULL;
++    *value = &empty_map_view;
+     return S_OK;
+ }
+ 
+diff --git a/dlls/windows.ui/corewindow.c b/dlls/windows.ui/corewindow.c
+index 9919980..d1d1114 100644
+--- a/dlls/windows.ui/corewindow.c
++++ b/dlls/windows.ui/corewindow.c
+@@ -917,6 +917,14 @@ static const struct ICoreWindowVtbl core_window_vtbl =
+ 
+ static LRESULT CALLBACK core_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+ {
++    if (msg == WM_ERASEBKGND) return 1;
++    if (msg == WM_PAINT)
++    {
++        PAINTSTRUCT ps;
++        HDC hdc = BeginPaint( hwnd, &ps );
++        EndPaint( hwnd, &ps );
++        return 0;
++    }
+     return DefWindowProcW( hwnd, msg, wparam, lparam );
+ }
+ 
+@@ -935,10 +943,12 @@ ICoreWindow *core_window_create(void)
+     impl->dispatcher = core_dispatcher_create();
+     impl->ref = 1;
+ 
++    wc.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
+     wc.lpfnWndProc = core_window_proc;
+     wc.hInstance = inst;
+     wc.lpszClassName = class_name;
+     wc.hCursor = LoadCursorW( NULL, (const WCHAR *)IDC_ARROW );
++    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+     RegisterClassExW( &wc );
+ 
+     impl->hwnd = CreateWindowExW( 0, class_name, NULL,
+-- 
+2.56.0
+
