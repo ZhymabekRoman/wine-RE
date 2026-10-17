@@ -14,3 +14,4 @@ Fixes: [58315] Clip Studio Paint 4 menus turn black when clicked
 
 # Code from: https://gitlab.winehq.org/zhiyi/wine/-/commits/bug-23698-react-native
 # Reference: https://gitlab.winehq.org/wine/wine/-/merge_requests/9839
+0071-dcomp-Fix-CreateSurface-AV-and-attach-shared-visual.patch
