@@ -1,0 +1,267 @@
+From 435152f5ce28e55d76e16dec6ffdeb2c4b7eddeb Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Sat, 17 Oct 2026 10:12:15 +0500
+Subject: [PATCH] windows.ui: Fix ICoreWindow vtable layout, stub missing
+ events and ICoreAcceleratorKeys
+
+---
+ dlls/windows.ui/corewindow.c | 149 +++++++++++++++++++++++++++++++++++
+ dlls/windows.ui/uisettings.c |   5 +-
+ 2 files changed, 152 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/windows.ui/corewindow.c b/dlls/windows.ui/corewindow.c
+index 4737b80..7b4ef25 100644
+--- a/dlls/windows.ui/corewindow.c
++++ b/dlls/windows.ui/corewindow.c
+@@ -157,6 +157,7 @@ IActivationFactory *corewindow_factory = &corewindow_statics.IActivationFactory_
+ struct core_dispatcher
+ {
+     ICoreDispatcher ICoreDispatcher_iface;
++    ICoreAcceleratorKeys ICoreAcceleratorKeys_iface;
+     LONG ref;
+ };
+ 
+@@ -165,12 +166,62 @@ static inline struct core_dispatcher *impl_from_ICoreDispatcher( ICoreDispatcher
+     return CONTAINING_RECORD( iface, struct core_dispatcher, ICoreDispatcher_iface );
+ }
+ 
++static inline struct core_dispatcher *impl_from_ICoreAcceleratorKeys( ICoreAcceleratorKeys *iface )
++{
++    return CONTAINING_RECORD( iface, struct core_dispatcher, ICoreAcceleratorKeys_iface );
++}
++
++static HRESULT WINAPI core_dispatcher_keys_QueryInterface( ICoreAcceleratorKeys *iface, REFIID iid, void **out )
++{
++    struct core_dispatcher *impl = impl_from_ICoreAcceleratorKeys( iface );
++    return ICoreDispatcher_QueryInterface( &impl->ICoreDispatcher_iface, iid, out );
++}
++static ULONG WINAPI core_dispatcher_keys_AddRef( ICoreAcceleratorKeys *iface )
++{
++    struct core_dispatcher *impl = impl_from_ICoreAcceleratorKeys( iface );
++    return ICoreDispatcher_AddRef( &impl->ICoreDispatcher_iface );
++}
++static ULONG WINAPI core_dispatcher_keys_Release( ICoreAcceleratorKeys *iface )
++{
++    struct core_dispatcher *impl = impl_from_ICoreAcceleratorKeys( iface );
++    return ICoreDispatcher_Release( &impl->ICoreDispatcher_iface );
++}
++static HRESULT WINAPI core_dispatcher_keys_GetIids( ICoreAcceleratorKeys *iface, ULONG *count, IID **iids )
++{ return E_NOTIMPL; }
++static HRESULT WINAPI core_dispatcher_keys_GetRuntimeClassName( ICoreAcceleratorKeys *iface, HSTRING *name )
++{ return WindowsCreateString( L"Windows.UI.Core.CoreDispatcher", 30, name ); }
++static HRESULT WINAPI core_dispatcher_keys_GetTrustLevel( ICoreAcceleratorKeys *iface, TrustLevel *level )
++{ if (level) *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI core_dispatcher_keys_add( ICoreAcceleratorKeys *iface, void *handler, EventRegistrationToken *cookie )
++{ if (cookie) cookie->value = 1; return S_OK; }
++static HRESULT WINAPI core_dispatcher_keys_remove( ICoreAcceleratorKeys *iface, EventRegistrationToken cookie )
++{ return S_OK; }
++
++static const struct ICoreAcceleratorKeysVtbl core_dispatcher_keys_vtbl =
++{
++    core_dispatcher_keys_QueryInterface,
++    core_dispatcher_keys_AddRef,
++    core_dispatcher_keys_Release,
++    core_dispatcher_keys_GetIids,
++    core_dispatcher_keys_GetRuntimeClassName,
++    core_dispatcher_keys_GetTrustLevel,
++    core_dispatcher_keys_add,
++    core_dispatcher_keys_remove,
++};
++
+ static HRESULT WINAPI core_dispatcher_QueryInterface( ICoreDispatcher *iface, REFIID iid, void **out )
+ {
+     struct core_dispatcher *impl = impl_from_ICoreDispatcher( iface );
+     if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+         IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICoreDispatcher ))
+     { ICoreDispatcher_AddRef( &impl->ICoreDispatcher_iface ); *out = &impl->ICoreDispatcher_iface; return S_OK; }
++    if (IsEqualGUID( iid, &IID_ICoreAcceleratorKeys ) ||
++        !memcmp( iid, "\xf5\xf7\xfd\x9f\xc9\xb8\xf0\x4e\xb7\xd2\x1d\xe6\x26\x56\x1f\xc8", 16 ))
++    {
++        ICoreDispatcher_AddRef( &impl->ICoreDispatcher_iface );
++        *out = &impl->ICoreAcceleratorKeys_iface;
++        return S_OK;
++    }
+     FIXME( "%s E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL; return E_NOINTERFACE;
+ }
+@@ -235,6 +286,7 @@ static ICoreDispatcher *core_dispatcher_create(void)
+     struct core_dispatcher *impl;
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
+     impl->ICoreDispatcher_iface.lpVtbl = &core_dispatcher_vtbl;
++    impl->ICoreAcceleratorKeys_iface.lpVtbl = &core_dispatcher_keys_vtbl;
+     impl->ref = 1;
+     return &impl->ICoreDispatcher_iface;
+ }
+@@ -262,11 +314,75 @@ struct core_window
+ {
+     ICoreWindow ICoreWindow_iface;
+     ICoreWindowInterop ICoreWindowInterop_iface;
++    IInspectable dummy_iface;
+     ICoreDispatcher *dispatcher;
+     HWND hwnd;
+     LONG ref;
+ };
+ 
++static inline struct core_window *impl_from_dummy( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct core_window, dummy_iface );
++}
++
++static HRESULT WINAPI dummy_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    struct core_window *impl = impl_from_dummy( iface );
++    return ICoreWindow_QueryInterface( &impl->ICoreWindow_iface, iid, out );
++}
++static ULONG WINAPI dummy_AddRef( IInspectable *iface )
++{
++    struct core_window *impl = impl_from_dummy( iface );
++    return ICoreWindow_AddRef( &impl->ICoreWindow_iface );
++}
++static ULONG WINAPI dummy_Release( IInspectable *iface )
++{
++    struct core_window *impl = impl_from_dummy( iface );
++    return ICoreWindow_Release( &impl->ICoreWindow_iface );
++}
++static HRESULT WINAPI dummy_GetIids( IInspectable *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI dummy_GetRuntimeClassName( IInspectable *iface, HSTRING *name )
++{ return WindowsCreateString( L"Windows.UI.Core.CoreWindow", 26, name ); }
++static HRESULT WINAPI dummy_GetTrustLevel( IInspectable *iface, TrustLevel *level ) { if (level) *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI dummy_event_add( void *iface, void *handler, EventRegistrationToken *cookie )
++{
++    if (cookie) cookie->value = 1;
++    return S_OK;
++}
++static HRESULT WINAPI dummy_event_remove( void *iface, EventRegistrationToken cookie )
++{
++    return S_OK;
++}
++
++static void *dummy_vtbl[] =
++{
++    dummy_QueryInterface,
++    dummy_AddRef,
++    dummy_Release,
++    dummy_GetIids,
++    dummy_GetRuntimeClassName,
++    dummy_GetTrustLevel,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++    dummy_event_add, dummy_event_remove,
++};
++
+ static inline struct core_window *impl_from_ICoreWindow( ICoreWindow *iface )
+ {
+     return CONTAINING_RECORD( iface, struct core_window, ICoreWindow_iface );
+@@ -330,6 +446,18 @@ static HRESULT WINAPI core_window_QueryInterface( ICoreWindow *iface, REFIID iid
+         *out = &impl->ICoreWindowInterop_iface;
+         return S_OK;
+     }
++    else if (!memcmp( iid, "\x3d\x7e\xa1\x42\x71\x71\x9a\x43\xb1\xfa\xa3\x1b\x7b\x95\x74\x89", 16 ) ||
++             !memcmp( iid, "\xd8\x79\x27\xc1\xd2\x85\xe5\x43\x90\x1a\x95\xdd\x4f\x8e\xcb\xa3", 16 ) ||
++             !memcmp( iid, "\x05\x2a\x88\x5f\x94\xd5\xbc\x48\x9a\x5a\xfd\x3b\x9c\xe9\x03\x90", 16 ) ||
++             !memcmp( iid, "\x85\x1b\x2b\x7c\x17\x69\x61\x43\x9c\x02\x0d\x9e\x3a\x42\x0b\x95", 16 ) ||
++             !memcmp( iid, "\xd8\x0d\xc2\x32\xef\xfa\x75\x43\xa2\xab\x32\x64\x0e\x48\x15\xc7", 16 ) ||
++             !memcmp( iid, "\xd0\xf0\xca\x35\xf0\x47\x6c\x43\xaf\x97\x0d\xd8\x8f\x6f\x5f\x02", 16 ) ||
++             !memcmp( iid, "\xe1\xe1\x4a\x4b\x6d\x2e\xaa\x4e\xbd\xa1\x1c\x5c\xc1\xbe\xe1\x41", 16 ))
++    {
++        ICoreWindow_AddRef( &impl->ICoreWindow_iface );
++        *out = &impl->dummy_iface;
++        return S_OK;
++    }
+     FIXME( "%s E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL; return E_NOINTERFACE;
+ }
+@@ -449,12 +577,22 @@ CORE_WINDOW_EVENT_ADD( KeyDown, Windows__CUI__CCore__CKeyEventArgs )
+ CORE_WINDOW_EVENT_REMOVE( KeyDown )
+ CORE_WINDOW_EVENT_ADD( KeyUp, Windows__CUI__CCore__CKeyEventArgs )
+ CORE_WINDOW_EVENT_REMOVE( KeyUp )
++CORE_WINDOW_EVENT_ADD( PointerCaptureLost, Windows__CUI__CCore__CPointerEventArgs )
++CORE_WINDOW_EVENT_REMOVE( PointerCaptureLost )
++CORE_WINDOW_EVENT_ADD( PointerEntered, Windows__CUI__CCore__CPointerEventArgs )
++CORE_WINDOW_EVENT_REMOVE( PointerEntered )
++CORE_WINDOW_EVENT_ADD( PointerExited, Windows__CUI__CCore__CPointerEventArgs )
++CORE_WINDOW_EVENT_REMOVE( PointerExited )
+ CORE_WINDOW_EVENT_ADD( PointerMoved, Windows__CUI__CCore__CPointerEventArgs )
+ CORE_WINDOW_EVENT_REMOVE( PointerMoved )
+ CORE_WINDOW_EVENT_ADD( PointerPressed, Windows__CUI__CCore__CPointerEventArgs )
+ CORE_WINDOW_EVENT_REMOVE( PointerPressed )
+ CORE_WINDOW_EVENT_ADD( PointerReleased, Windows__CUI__CCore__CPointerEventArgs )
+ CORE_WINDOW_EVENT_REMOVE( PointerReleased )
++CORE_WINDOW_EVENT_ADD( TouchHitTesting, Windows__CUI__CCore__CTouchHitTestingEventArgs )
++CORE_WINDOW_EVENT_REMOVE( TouchHitTesting )
++CORE_WINDOW_EVENT_ADD( PointerWheelChanged, Windows__CUI__CCore__CPointerEventArgs )
++CORE_WINDOW_EVENT_REMOVE( PointerWheelChanged )
+ CORE_WINDOW_EVENT_ADD( SizeChanged, Windows__CUI__CCore__CWindowSizeChangedEventArgs )
+ CORE_WINDOW_EVENT_REMOVE( SizeChanged )
+ CORE_WINDOW_EVENT_ADD( VisibilityChanged, Windows__CUI__CCore__CVisibilityChangedEventArgs )
+@@ -502,12 +640,22 @@ static const struct ICoreWindowVtbl core_window_vtbl =
+     core_window_remove_KeyDown,
+     core_window_add_KeyUp,
+     core_window_remove_KeyUp,
++    core_window_add_PointerCaptureLost,
++    core_window_remove_PointerCaptureLost,
++    core_window_add_PointerEntered,
++    core_window_remove_PointerEntered,
++    core_window_add_PointerExited,
++    core_window_remove_PointerExited,
+     core_window_add_PointerMoved,
+     core_window_remove_PointerMoved,
+     core_window_add_PointerPressed,
+     core_window_remove_PointerPressed,
+     core_window_add_PointerReleased,
+     core_window_remove_PointerReleased,
++    core_window_add_TouchHitTesting,
++    core_window_remove_TouchHitTesting,
++    core_window_add_PointerWheelChanged,
++    core_window_remove_PointerWheelChanged,
+     core_window_add_SizeChanged,
+     core_window_remove_SizeChanged,
+     core_window_add_VisibilityChanged,
+@@ -530,6 +678,7 @@ ICoreWindow *core_window_create(void)
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
+     impl->ICoreWindow_iface.lpVtbl = &core_window_vtbl;
+     impl->ICoreWindowInterop_iface.lpVtbl = &core_window_interop_vtbl;
++    impl->dummy_iface.lpVtbl = (void *)dummy_vtbl;
+     impl->dispatcher = core_dispatcher_create();
+     impl->ref = 1;
+ 
+diff --git a/dlls/windows.ui/uisettings.c b/dlls/windows.ui/uisettings.c
+index c816ed8..4b9e00d 100644
+--- a/dlls/windows.ui/uisettings.c
++++ b/dlls/windows.ui/uisettings.c
+@@ -286,13 +286,14 @@ static HRESULT WINAPI uisettings2_add_TextScaleFactorChanged( IUISettings2 *ifac
+         EventRegistrationToken *cookie )
+ {
+     FIXME( "iface %p, handler %p, cookie %p stub!\n", iface, handler, cookie );
+-    return E_NOTIMPL;
++    *cookie = dummy_cookie;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uisettings2_remove_TextScaleFactorChanged( IUISettings2 *iface, EventRegistrationToken cookie )
+ {
+     FIXME( "iface %p, cookie %#I64x stub!\n", iface, cookie.value );
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static const struct IUISettings2Vtbl uisettings2_vtbl =
+-- 
+2.56.0
+
