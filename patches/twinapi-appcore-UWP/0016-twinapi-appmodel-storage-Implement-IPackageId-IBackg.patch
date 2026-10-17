@@ -1,0 +1,492 @@
+From eddce84442427b4f37f2388036e3af4b735dd987 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Sat, 17 Oct 2026 17:48:57 +0500
+Subject: [PATCH] twinapi, appmodel, storage: Implement IPackageId,
+ IBackgroundExecutionManagerStatics, IPushNotificationChannelManagerStatics4,
+ and container_CreateContainer
+
+---
+ .../client_device_information.c               |  47 +++++
+ dlls/twinapi.appcore/main.c                   | 198 ++++++++++++++++++
+ dlls/windows.applicationmodel/package.c       | 135 +++++++++++-
+ .../applicationdata.c                         |   8 +-
+ 4 files changed, 383 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/twinapi.appcore/client_device_information.c b/dlls/twinapi.appcore/client_device_information.c
+index 0cfbc00..f4adf63 100644
+--- a/dlls/twinapi.appcore/client_device_information.c
++++ b/dlls/twinapi.appcore/client_device_information.c
+@@ -23,9 +23,12 @@ WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+ struct client_device_information
+ {
+     IEasClientDeviceInformation IEasClientDeviceInformation_iface;
++    const void *vtbl2;
+     LONG ref;
+ };
+ 
++static const void *client_device_information2_vtbl[];
++
+ static inline struct client_device_information *impl_from_IEasClientDeviceInformation( IEasClientDeviceInformation *iface )
+ {
+     return CONTAINING_RECORD( iface, struct client_device_information, IEasClientDeviceInformation_iface );
+@@ -35,6 +38,7 @@ static HRESULT WINAPI client_device_information_QueryInterface( IEasClientDevice
+                                                                 REFIID iid, void **out )
+ {
+     struct client_device_information *impl = impl_from_IEasClientDeviceInformation( iface );
++    static const GUID IID_IEasClientDeviceInformation2 = {0xffb35923, 0xbb26, 0x4d6a, {0x81, 0xbc, 0x16, 0x5a, 0xee, 0x0a, 0xd7, 0x54}};
+ 
+     TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+ 
+@@ -45,6 +49,12 @@ static HRESULT WINAPI client_device_information_QueryInterface( IEasClientDevice
+         IEasClientDeviceInformation_AddRef( (*out = &impl->IEasClientDeviceInformation_iface) );
+         return S_OK;
+     }
++    else if (IsEqualGUID( iid, &IID_IEasClientDeviceInformation2 ))
++    {
++        *out = &impl->vtbl2;
++        IEasClientDeviceInformation_AddRef( iface );
++        return S_OK;
++    }
+ 
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+@@ -206,6 +216,42 @@ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLev
+     return E_NOTIMPL;
+ }
+ 
++static HRESULT WINAPI client_device_information2_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    struct client_device_information *impl = CONTAINING_RECORD( (const void **)iface, struct client_device_information, vtbl2 );
++    return client_device_information_QueryInterface( &impl->IEasClientDeviceInformation_iface, iid, out );
++}
++static ULONG WINAPI client_device_information2_AddRef( void *iface )
++{
++    struct client_device_information *impl = CONTAINING_RECORD( (const void **)iface, struct client_device_information, vtbl2 );
++    return client_device_information_AddRef( &impl->IEasClientDeviceInformation_iface );
++}
++static ULONG WINAPI client_device_information2_Release( void *iface )
++{
++    struct client_device_information *impl = CONTAINING_RECORD( (const void **)iface, struct client_device_information, vtbl2 );
++    return client_device_information_Release( &impl->IEasClientDeviceInformation_iface );
++}
++static HRESULT WINAPI client_device_information_get_SystemHardwareVersion( void *iface, HSTRING *value )
++{
++    return WindowsCreateString( L"1.0", 3, value );
++}
++static HRESULT WINAPI client_device_information_get_SystemFirmwareVersion( void *iface, HSTRING *value )
++{
++    return WindowsCreateString( L"1.0", 3, value );
++}
++
++static const void *client_device_information2_vtbl[] =
++{
++    client_device_information2_QueryInterface,
++    client_device_information2_AddRef,
++    client_device_information2_Release,
++    client_device_information_GetIids,
++    client_device_information_GetRuntimeClassName,
++    client_device_information_GetTrustLevel,
++    client_device_information_get_SystemHardwareVersion,
++    client_device_information_get_SystemFirmwareVersion,
++};
++
+ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+ {
+     struct client_device_information *impl;
+@@ -214,6 +260,7 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
+ 
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+     impl->IEasClientDeviceInformation_iface.lpVtbl = &client_device_information_vtbl;
++    impl->vtbl2 = client_device_information2_vtbl;
+     impl->ref = 1;
+ 
+     *instance = (IInspectable *)&impl->IEasClientDeviceInformation_iface;
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index be3daa8..8dded12 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -55,6 +55,200 @@ void WINAPI UnregisterAppStateChangeNotification( PAPPSTATE_REGISTRATION reg )
+     FIXME( "reg %p - stub.\n", reg );
+ }
+ 
++/* Async Operation Stub */
++static HRESULT WINAPI dummy_async_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    *out = iface;
++    return S_OK;
++}
++static ULONG WINAPI dummy_async_AddRef( void *iface ) { return 2; }
++static ULONG WINAPI dummy_async_Release( void *iface ) { return 1; }
++static HRESULT WINAPI dummy_async_GetIids( void *iface, ULONG *c, IID **i ) { return E_NOTIMPL; }
++static HRESULT WINAPI dummy_async_GetRuntimeClassName( void *iface, HSTRING *n )
++{
++    return WindowsCreateString( L"Windows.Foundation.IAsyncOperation", 32, n );
++}
++static HRESULT WINAPI dummy_async_GetTrustLevel( void *iface, TrustLevel *l )
++{
++    if (l) *l = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI dummy_async_put_Completed( void *iface, void *handler )
++{
++    if (handler)
++    {
++        void **vtbl = *(void ***)handler;
++        HRESULT (STDMETHODCALLTYPE *invoke)(void *, void *, UINT32) = (void *)vtbl[3];
++        if (invoke) invoke( handler, iface, 1 /* Completed */ );
++    }
++    return S_OK;
++}
++static HRESULT WINAPI dummy_async_get_Completed( void *iface, void **handler ) { if (handler) *handler = NULL; return S_OK; }
++static HRESULT WINAPI dummy_async_GetResults( void *iface, DWORD *results ) { if (results) *results = 0 /* Denied */; return S_OK; }
++
++static HRESULT WINAPI dummy_async_get_Id( void *iface, UINT32 *id ) { if (id) *id = 1; return S_OK; }
++static HRESULT WINAPI dummy_async_get_Status( void *iface, UINT32 *status ) { if (status) *status = 1 /* Completed */; return S_OK; }
++static HRESULT WINAPI dummy_async_get_ErrorCode( void *iface, HRESULT *err ) { if (err) *err = S_OK; return S_OK; }
++static HRESULT WINAPI dummy_async_Cancel( void *iface ) { return S_OK; }
++static HRESULT WINAPI dummy_async_Close( void *iface ) { return S_OK; }
++
++static const void *dummy_async_vtbl[] =
++{
++    dummy_async_QueryInterface,
++    dummy_async_AddRef,
++    dummy_async_Release,
++    dummy_async_GetIids,
++    dummy_async_GetRuntimeClassName,
++    dummy_async_GetTrustLevel,
++    dummy_async_put_Completed,
++    dummy_async_get_Completed,
++    dummy_async_GetResults,
++    dummy_async_get_Id,
++    dummy_async_get_Status,
++    dummy_async_get_ErrorCode,
++    dummy_async_Cancel,
++    dummy_async_Close,
++};
++
++static struct { const void *vtbl; } dummy_async = { dummy_async_vtbl };
++
++/* Push Notification Channel Manager */
++static HRESULT WINAPI push_notification_stub( void *iface, void *a, void *b, void *c )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI push_notification_add_ChannelsRevoked( void *iface, void *handler, EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p, token %p\n", iface, handler, token );
++    if (token) token->value = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI push_notification_remove_ChannelsRevoked( void *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static const void *push_notification_factory_vtbl[];
++static const void *push_notification_statics4_vtbl[];
++static struct
++{
++    const void *vtbl_factory;
++    const void *vtbl_statics4;
++} push_notification_obj = { push_notification_factory_vtbl, push_notification_statics4_vtbl };
++
++static HRESULT WINAPI push_notification_factory_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    static const GUID IID_IPushNotificationChannelManagerStatics4 = {0xbc540efb, 0x7820, 0x5a5b, {0x9c, 0x01, 0xb4, 0x75, 0x7f, 0x77, 0x40, 0x25}};
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ) ||
++        !memcmp( iid, "\x65\x9b\xaf\x8b\xa1\x77\x88\x45\xbd\x19\x86\x15\x29\xa9\xdc\xf0", 16 ))
++    {
++        *out = &push_notification_obj.vtbl_factory;
++        return S_OK;
++    }
++    else if (IsEqualGUID( iid, &IID_IPushNotificationChannelManagerStatics4 ))
++    {
++        *out = &push_notification_obj.vtbl_statics4;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static HRESULT WINAPI push_notification_statics4_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    return push_notification_factory_QueryInterface( iface, iid, out );
++}
++
++static ULONG WINAPI push_notification_factory_AddRef( void *iface ) { return 2; }
++static ULONG WINAPI push_notification_factory_Release( void *iface ) { return 1; }
++static HRESULT WINAPI push_notification_factory_GetIids( void *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI push_notification_factory_GetRuntimeClassName( void *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Networking.PushNotifications.PushNotificationChannelManager", 59, name );
++}
++static HRESULT WINAPI push_notification_factory_GetTrustLevel( void *iface, TrustLevel *level )
++{
++    if (level) *level = BaseTrust;
++    return S_OK;
++}
++
++static const void *push_notification_factory_vtbl[] =
++{
++    push_notification_factory_QueryInterface,
++    push_notification_factory_AddRef,
++    push_notification_factory_Release,
++    push_notification_factory_GetIids,
++    push_notification_factory_GetRuntimeClassName,
++    push_notification_factory_GetTrustLevel,
++    push_notification_stub, /* ActivateInstance */
++    push_notification_stub, /* CreatePushNotificationChannelForApplicationAsync */
++    push_notification_stub,
++    push_notification_stub,
++    push_notification_stub,
++    push_notification_stub,
++};
++
++static const void *push_notification_statics4_vtbl[] =
++{
++    push_notification_statics4_QueryInterface,
++    push_notification_factory_AddRef,
++    push_notification_factory_Release,
++    push_notification_factory_GetIids,
++    push_notification_factory_GetRuntimeClassName,
++    push_notification_factory_GetTrustLevel,
++    push_notification_add_ChannelsRevoked,
++    push_notification_remove_ChannelsRevoked,
++};
++
++/* Background Execution Manager */
++static HRESULT WINAPI bg_manager_RequestAccessAsync( void *iface, void **operation )
++{
++    TRACE( "iface %p, operation %p\n", iface, operation );
++    if (!operation) return E_POINTER;
++    *operation = &dummy_async;
++    return S_OK;
++}
++
++static const void *bg_manager_factory_vtbl[];
++static struct { const void *vtbl; } bg_manager_obj = { bg_manager_factory_vtbl };
++
++static HRESULT WINAPI bg_manager_factory_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    static const GUID IID_IBackgroundExecutionManagerStatics = {0xe826ea58, 0x66a9, 0x4d41, {0x83, 0xd4, 0xb4, 0xc1, 0x8c, 0x87, 0xb8, 0x46}};
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ) ||
++        IsEqualGUID( iid, &IID_IBackgroundExecutionManagerStatics ))
++    {
++        *out = &bg_manager_obj;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static const void *bg_manager_factory_vtbl[] =
++{
++    bg_manager_factory_QueryInterface,
++    push_notification_factory_AddRef,
++    push_notification_factory_Release,
++    push_notification_factory_GetIids,
++    push_notification_factory_GetRuntimeClassName,
++    push_notification_factory_GetTrustLevel,
++    bg_manager_RequestAccessAsync, /* slot 6: RequestAccessAsync */
++    push_notification_stub,
++    push_notification_stub,
++    push_notification_stub,
++    push_notification_stub,
++};
++
+ HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **out )
+ {
+     FIXME( "clsid %s, riid %s, out %p stub!\n", debugstr_guid(clsid), debugstr_guid(riid), out );
+@@ -83,6 +277,10 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( app_instance_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_DataTransfer_DataTransferManager ))
+         IActivationFactory_QueryInterface( data_transfer_manager_statics_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, L"Windows.Networking.PushNotifications.PushNotificationChannelManager" ))
++        *factory = (IActivationFactory *)&push_notification_obj;
++    else if (!wcscmp( buffer, L"Windows.ApplicationModel.Background.BackgroundExecutionManager" ))
++        *factory = (IActivationFactory *)&bg_manager_obj;
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.applicationmodel/package.c b/dlls/windows.applicationmodel/package.c
+index 5d55188..58aa385 100644
+--- a/dlls/windows.applicationmodel/package.c
++++ b/dlls/windows.applicationmodel/package.c
+@@ -442,10 +442,141 @@ static HRESULT WINAPI package_GetTrustLevel( IPackage *iface, TrustLevel *trust_
+     return E_NOTIMPL;
+ }
+ 
++struct package_id
++{
++    IPackageId IPackageId_iface;
++    LONG ref;
++};
++
++static inline struct package_id *impl_from_IPackageId( IPackageId *iface )
++{
++    return CONTAINING_RECORD( iface, struct package_id, IPackageId_iface );
++}
++
++static HRESULT WINAPI package_id_QueryInterface( IPackageId *iface, REFIID iid, void **out )
++{
++    struct package_id *impl = impl_from_IPackageId( iface );
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IPackageId ))
++    {
++        *out = &impl->IPackageId_iface;
++        IInspectable_AddRef( (IInspectable *)*out );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI package_id_AddRef( IPackageId *iface )
++{
++    struct package_id *impl = impl_from_IPackageId( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI package_id_Release( IPackageId *iface )
++{
++    struct package_id *impl = impl_from_IPackageId( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI package_id_GetIids( IPackageId *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI package_id_GetRuntimeClassName( IPackageId *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.ApplicationModel.PackageId", 34, name );
++}
++static HRESULT WINAPI package_id_GetTrustLevel( IPackageId *iface, TrustLevel *level )
++{
++    if (level) *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI package_id_get_Name( IPackageId *iface, HSTRING *value )
++{
++    WCHAR buf[MAX_PATH];
++    if (!GetEnvironmentVariableW( L"WINE_PACKAGE_FAMILY_NAME", buf, ARRAY_SIZE(buf) ))
++        wcscpy( buf, L"5319275A.WhatsAppDesktop" );
++    return WindowsCreateString( buf, wcslen(buf), value );
++}
++
++static HRESULT WINAPI package_id_get_Version( IPackageId *iface, struct PackageVersion *value )
++{
++    if (!value) return E_POINTER;
++    value->Major = 2;
++    value->Minor = 2620;
++    value->Build = 102;
++    value->Revision = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI package_id_get_Architecture( IPackageId *iface, enum __x_ABI_CWindows_CSystem_CProcessorArchitecture *value )
++{
++    if (!value) return E_POINTER;
++    *value = 9; /* X64 */
++    return S_OK;
++}
++
++static HRESULT WINAPI package_id_get_ResourceId( IPackageId *iface, HSTRING *value )
++{
++    return WindowsCreateString( L"", 0, value );
++}
++
++static HRESULT WINAPI package_id_get_Publisher( IPackageId *iface, HSTRING *value )
++{
++    return WindowsCreateString( L"CN=WhatsApp", 11, value );
++}
++
++static HRESULT WINAPI package_id_get_PublisherId( IPackageId *iface, HSTRING *value )
++{
++    return WindowsCreateString( L"cv1g1gvanyjgm", 13, value );
++}
++
++static HRESULT WINAPI package_id_get_FullName( IPackageId *iface, HSTRING *value )
++{
++    WCHAR buf[MAX_PATH];
++    if (!GetEnvironmentVariableW( L"WINE_PACKAGE_FULL_NAME", buf, ARRAY_SIZE(buf) ))
++        wcscpy( buf, L"5319275A.WhatsAppDesktop_2.2620.102.0_x64__cv1g1gvanyjgm" );
++    return WindowsCreateString( buf, wcslen(buf), value );
++}
++
++static HRESULT WINAPI package_id_get_FamilyName( IPackageId *iface, HSTRING *value )
++{
++    WCHAR buf[MAX_PATH];
++    if (!GetEnvironmentVariableW( L"WINE_PACKAGE_FAMILY_NAME", buf, ARRAY_SIZE(buf) ))
++        wcscpy( buf, L"5319275A.WhatsAppDesktop_cv1g1gvanyjgm" );
++    return WindowsCreateString( buf, wcslen(buf), value );
++}
++
++static const struct IPackageIdVtbl package_id_vtbl =
++{
++    package_id_QueryInterface,
++    package_id_AddRef,
++    package_id_Release,
++    package_id_GetIids,
++    package_id_GetRuntimeClassName,
++    package_id_GetTrustLevel,
++    package_id_get_Name,
++    package_id_get_Version,
++    package_id_get_Architecture,
++    package_id_get_ResourceId,
++    package_id_get_Publisher,
++    package_id_get_PublisherId,
++    package_id_get_FullName,
++    package_id_get_FamilyName,
++};
++
+ static HRESULT WINAPI package_get_Id( IPackage *iface, IPackageId **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct package_id *impl;
++    TRACE( "iface %p, value %p\n", iface, value );
++    if (!value) return E_INVALIDARG;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IPackageId_iface.lpVtbl = &package_id_vtbl;
++    impl->ref = 1;
++    *value = &impl->IPackageId_iface;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI package_get_InstalledLocation( IPackage *iface, IStorageFolder **value )
+diff --git a/dlls/windows.storage.applicationdata/applicationdata.c b/dlls/windows.storage.applicationdata/applicationdata.c
+index 97f90f6..65cfa14 100644
+--- a/dlls/windows.storage.applicationdata/applicationdata.c
++++ b/dlls/windows.storage.applicationdata/applicationdata.c
+@@ -313,12 +313,14 @@ static HRESULT WINAPI container_get_Containers( IApplicationDataContainer *iface
+     return S_OK;
+ }
+ 
++static HRESULT container_create( ApplicationDataLocality locality, IApplicationDataContainer **out );
++
+ static HRESULT WINAPI container_CreateContainer( IApplicationDataContainer *iface, HSTRING name, ApplicationDataCreateDisposition disposition, IApplicationDataContainer **container )
+ {
+-    FIXME( "stub\n" );
++    struct application_data_container *parent = impl_from_IApplicationDataContainer( iface );
++    TRACE( "iface %p, name %s, disposition %d, container %p\n", iface, debugstr_hstring(name), disposition, container );
+     if (!container) return E_POINTER;
+-    *container = NULL;
+-    return S_OK;
++    return container_create( parent->locality, container );
+ }
+ 
+ static HRESULT WINAPI container_DeleteContainer( IApplicationDataContainer *iface, HSTRING name )
+-- 
+2.56.0
+
