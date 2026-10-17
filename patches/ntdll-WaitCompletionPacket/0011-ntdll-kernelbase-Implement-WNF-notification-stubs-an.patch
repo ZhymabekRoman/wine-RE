@@ -1,0 +1,96 @@
+From 161d81e4a64082886e5fb18c2909129e18cd8dc4 Mon Sep 17 00:00:00 2001
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Date: Sat, 17 Oct 2026 11:21:36 +0500
+Subject: [PATCH] ntdll, kernelbase: Implement WNF notification stubs and fix
+ CloseHandle STATUS_ACCESS_DENIED failfast
+
+---
+ dlls/kernelbase/process.c |  2 +-
+ dlls/ntdll/ntdll.spec     |  4 ++++
+ dlls/ntdll/sync.c         | 35 ++++++++++++++++++++++++++++++++---
+ 3 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
+index e88b7fb..224d132 100644
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -431,7 +431,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CloseHandle( HANDLE handle )
+         handle = InterlockedExchangePointer( &NtCurrentTeb()->Peb->ProcessParameters->hStdError, 0 );
+ 
+     status = NtClose( handle );
+-    if (status == STATUS_INVALID_HANDLE || status == STATUS_HANDLE_NOT_CLOSABLE) return TRUE;
++    if (status == STATUS_INVALID_HANDLE || status == STATUS_HANDLE_NOT_CLOSABLE || status == STATUS_ACCESS_DENIED) return TRUE;
+     return set_ntstatus( status );
+ }
+ 
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 063e3a2..87e1789 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1072,6 +1072,10 @@
+ @ stdcall RtlSubAuthoritySid(ptr long)
+ @ stdcall RtlSubtreePredecessor(ptr)
+ @ stdcall RtlSubtreeSuccessor(ptr)
++@ stdcall RtlPublishWnfStateData(ptr ptr ptr long ptr)
++@ stdcall RtlQueryWnfStateData(ptr ptr ptr ptr ptr)
++@ stdcall RtlSubscribeWnfStateChangeNotification(ptr int64 long ptr ptr ptr long long)
++@ stdcall RtlUnsubscribeWnfStateChangeNotification(ptr)
+ @ stdcall RtlSystemTimeToLocalTime(ptr ptr)
+ @ stdcall RtlTimeFieldsToTime(ptr ptr)
+ @ stdcall RtlTimeToElapsedTimeFields(ptr ptr)
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index b981f28..60016df 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -355,9 +355,6 @@ NTSTATUS WINAPI RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
+  */
+ NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
+ {
+-    if (!crit->OwningThread && !crit->RecursionCount && !crit->LockCount)
+-        InterlockedCompareExchange( &crit->LockCount, -1, 0 );
+-
+     if (crit->SpinCount)
+     {
+         ULONG count;
+@@ -1219,6 +1216,38 @@ void WINAPI RtlInitializeResource(LPRTL_RWLOCK rwl)
+     NtCreateSemaphore( &rwl->hSharedReleaseSemaphore, SEMAPHORE_ALL_ACCESS, NULL, 0, 65535 );
+ }
+ 
++/***********************************************************************
++ *           WNF Notification Stubs (NTDLL.@)
++ */
++NTSTATUS WINAPI RtlSubscribeWnfStateChangeNotification( void **subscription, ULONG64 state_name,
++                                                        ULONG change_stamp, void *callback,
++                                                        void *context, void *type_id,
++                                                        ULONG serialization_group, ULONG flags )
++{
++    FIXME( "(%p, %016llx, %lu, %p, %p, %p, %lu, %lu): stub\n",
++           subscription, (long long unsigned int)state_name, change_stamp, callback, context, type_id, serialization_group, flags );
++    if (subscription) *subscription = (void *)0xdeadbeef;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS WINAPI RtlUnsubscribeWnfStateChangeNotification( void *subscription )
++{
++    FIXME( "(%p): stub\n", subscription );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS WINAPI RtlQueryWnfStateData( ULONG64 *state_name, void *type_id, void *buffer, ULONG *buffer_size, ULONG *change_stamp )
++{
++    FIXME( "(%p, %p, %p, %p, %p): stub\n", state_name, type_id, buffer, buffer_size, change_stamp );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS WINAPI RtlPublishWnfStateData( ULONG64 *state_name, void *type_id, const void *buffer, ULONG buffer_size, void *explicit_scope )
++{
++    FIXME( "(%p, %p, %p, %lu, %p): stub\n", state_name, type_id, buffer, buffer_size, explicit_scope );
++    return STATUS_SUCCESS;
++}
++
+ /***********************************************************************
+  *           RtlDeleteResource   (NTDLL.@)
+  */
+-- 
+2.56.0
+
