@@ -1,0 +1,185 @@
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Subject: [PATCH] storage, ui: Implement IApplicationData2 and fix ICoreDispatcher vtable
+
+Implement IApplicationData2 with LocalCacheFolder property, and align
+ICoreDispatcher vtable to official IDL structure.
+---
+ dlls/windows.storage.applicationdata/applicationdata.c | 71 +++++++++++++++++++-
+ dlls/windows.ui/corewindow.c                          | 41 ++++++++++---
+ 2 files changed, 97 insertions(+), 15 deletions(-)
+
+diff --git a/dlls/windows.storage.applicationdata/applicationdata.c b/dlls/windows.storage.applicationdata/applicationdata.c
+index 4b2c926..97f90f6 100644
+--- a/dlls/windows.storage.applicationdata/applicationdata.c
++++ b/dlls/windows.storage.applicationdata/applicationdata.c
+@@ -118,6 +118,7 @@ static const struct IActivationFactoryVtbl factory_vtbl =
+ struct application_data
+ {
+     IApplicationData IApplicationData_iface;
++    IApplicationData2 IApplicationData2_iface;
+     LONG ref;
+ };
+ 
+@@ -126,6 +127,11 @@ static inline struct application_data *impl_from_IApplicationData( IApplicationD
+     return CONTAINING_RECORD( iface, struct application_data, IApplicationData_iface );
+ }
+ 
++static inline struct application_data *impl_from_IApplicationData2( IApplicationData2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct application_data, IApplicationData2_iface );
++}
++
+ static HRESULT WINAPI application_data_QueryInterface( IApplicationData *iface, REFIID iid, void **out )
+ {
+     struct application_data *impl = impl_from_IApplicationData( iface );
+@@ -138,7 +144,14 @@ static HRESULT WINAPI application_data_QueryInterface( IApplicationData *iface,
+         IsEqualGUID( iid, &IID_IApplicationData ))
+     {
+         *out = &impl->IApplicationData_iface;
+-        IInspectable_AddRef( *out );
++        IInspectable_AddRef( (IInspectable *)*out );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_IApplicationData2 ))
++    {
++        *out = &impl->IApplicationData2_iface;
++        IInspectable_AddRef( (IInspectable *)*out );
+         return S_OK;
+     }
+ 
+@@ -627,6 +640,61 @@ static const struct IApplicationDataVtbl application_data_vtbl =
+     application_data_get_RoamingStorageQuota,
+ };
+ 
++static HRESULT WINAPI application_data2_QueryInterface( IApplicationData2 *iface, REFIID iid, void **out )
++{
++    struct application_data *impl = impl_from_IApplicationData2( iface );
++    return IApplicationData_QueryInterface( &impl->IApplicationData_iface, iid, out );
++}
++static ULONG WINAPI application_data2_AddRef( IApplicationData2 *iface )
++{
++    struct application_data *impl = impl_from_IApplicationData2( iface );
++    return IApplicationData_AddRef( &impl->IApplicationData_iface );
++}
++static ULONG WINAPI application_data2_Release( IApplicationData2 *iface )
++{
++    struct application_data *impl = impl_from_IApplicationData2( iface );
++    return IApplicationData_Release( &impl->IApplicationData_iface );
++}
++static HRESULT WINAPI application_data2_GetIids( IApplicationData2 *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "stub\n" ); return E_NOTIMPL;
++}
++static HRESULT WINAPI application_data2_GetRuntimeClassName( IApplicationData2 *iface, HSTRING *class_name )
++{
++    return WindowsCreateString( L"Windows.Storage.ApplicationData", 30, class_name );
++}
++static HRESULT WINAPI application_data2_GetTrustLevel( IApplicationData2 *iface, TrustLevel *trust_level )
++{
++    if (trust_level) *trust_level = BaseTrust; return S_OK;
++}
++static HRESULT WINAPI application_data2_get_LocalCacheFolder( IApplicationData2 *iface, IStorageFolder **value )
++{
++    WCHAR path[MAX_PATH];
++    TRACE( "iface %p, value %p\n", iface, value );
++    if (!value) return E_POINTER;
++    if (!GetEnvironmentVariableW( L"LOCALAPPDATA", path, ARRAY_SIZE(path) ))
++    {
++        if (!GetEnvironmentVariableW( L"USERPROFILE", path, ARRAY_SIZE(path) ))
++            return E_FAIL;
++        lstrcatW( path, L"\\AppData\\Local" );
++    }
++    lstrcatW( path, L"\\WhatsApp\\LocalCache" );
++    return storage_folder_create( path, value );
++}
++
++static const struct IApplicationData2Vtbl application_data2_vtbl =
++{
++    application_data2_QueryInterface,
++    application_data2_AddRef,
++    application_data2_Release,
++    /* IInspectable methods */
++    application_data2_GetIids,
++    application_data2_GetRuntimeClassName,
++    application_data2_GetTrustLevel,
++    /* IApplicationData2 methods */
++    application_data2_get_LocalCacheFolder,
++};
++
+ DEFINE_IINSPECTABLE( application_data_statics, IApplicationDataStatics, struct application_data_statics, IActivationFactory_iface )
+ 
+ static HRESULT WINAPI application_data_statics_get_Current( IApplicationDataStatics *iface, IApplicationData **value )
+@@ -639,6 +707,7 @@ static HRESULT WINAPI application_data_statics_get_Current( IApplicationDataStat
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+ 
+     impl->IApplicationData_iface.lpVtbl = &application_data_vtbl;
++    impl->IApplicationData2_iface.lpVtbl = &application_data2_vtbl;
+     impl->ref = 1;
+ 
+     *value = &impl->IApplicationData_iface;
+diff --git a/dlls/windows.ui/corewindow.c b/dlls/windows.ui/corewindow.c
+index 7b4ef25..1236db4 100644
+--- a/dlls/windows.ui/corewindow.c
++++ b/dlls/windows.ui/corewindow.c
+@@ -245,7 +245,37 @@ static HRESULT WINAPI core_dispatcher_AcceleratorKeyActivated_add( ICoreDispatch
+ static HRESULT WINAPI core_dispatcher_AcceleratorKeyActivated_remove( ICoreDispatcher *iface, EventRegistrationToken cookie )
+ { FIXME( "stub\n" ); return S_OK; }
+ static HRESULT WINAPI core_dispatcher_ProcessEvents( ICoreDispatcher *iface, CoreProcessEventsOption options )
+-{ FIXME( "iface %p, options %d stub — spinning?\n", iface, options ); return S_OK; }
++{
++    MSG msg;
++    TRACE( "iface %p, options %d\n", iface, options );
++
++    if (options == CoreProcessEventsOption_ProcessUntilQuit)
++    {
++        while (GetMessageW( &msg, NULL, 0, 0 ))
++        {
++            TranslateMessage( &msg );
++            DispatchMessageW( &msg );
++        }
++    }
++    else if (options == CoreProcessEventsOption_ProcessOneIfPresent)
++    {
++        if (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE ))
++        {
++            TranslateMessage( &msg );
++            DispatchMessageW( &msg );
++        }
++    }
++    else
++    {
++        while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE ))
++        {
++            if (msg.message == WM_QUIT) break;
++            TranslateMessage( &msg );
++            DispatchMessageW( &msg );
++        }
++    }
++    return S_OK;
++}
+ static HRESULT WINAPI core_dispatcher_RunAsync( ICoreDispatcher *iface, CoreDispatcherPriority priority,
+         void *agileCallback, IAsyncAction **asyncAction )
+ { FIXME( "stub\n" ); return E_NOTIMPL; }
+@@ -268,17 +298,10 @@ static const struct ICoreDispatcherVtbl core_dispatcher_vtbl =
+     core_dispatcher_GetIids,
+     core_dispatcher_GetRuntimeClassName,
+     core_dispatcher_GetTrustLevel,
+-    core_dispatcher_get_AutomationProviderDelegate,
+-    core_dispatcher_put_AutomationProviderDelegate,
+-    core_dispatcher_AcceleratorKeyActivated_add,
+-    core_dispatcher_AcceleratorKeyActivated_remove,
++    core_dispatcher_HasThreadAccess,
+     core_dispatcher_ProcessEvents,
+     core_dispatcher_RunAsync,
+     core_dispatcher_RunIdleAsync,
+-    core_dispatcher_HasThreadAccess,
+-    core_dispatcher_get_CurrentPriority,
+-    core_dispatcher_put_CurrentPriority,
+-    core_dispatcher_StopProcessEvents,
+ };
+ 
+ static ICoreDispatcher *core_dispatcher_create(void)
+-- 
+2.56.0
+

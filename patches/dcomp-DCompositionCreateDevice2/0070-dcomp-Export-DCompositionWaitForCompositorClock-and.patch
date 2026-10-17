@@ -1,0 +1,63 @@
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Subject: [PATCH] dcomp: Export DCompositionWaitForCompositorClock and support partner interface
+
+---
+ dlls/dcomp/dcomp.spec |  1 +
+ dlls/dcomp/device.c   | 16 +++++++++++++++-
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/dcomp/dcomp.spec b/dlls/dcomp/dcomp.spec
+index d84fe60..1ca6598 100644
+--- a/dlls/dcomp/dcomp.spec
++++ b/dlls/dcomp/dcomp.spec
+@@ -17,6 +17,7 @@
+ @ stdcall DCompositionCreateDevice3(ptr ptr ptr)
+ @ stdcall DCompositionCreateDevice(ptr ptr ptr)
+ @ stub DCompositionCreateSurfaceHandle
++@ stdcall DCompositionWaitForCompositorClock(long ptr long)
+ @ stub DeserializeEffectDescription
+ @ stdcall -private DllCanUnloadNow()
+ @ stub DllGetActivationFactory
+diff --git a/dlls/dcomp/device.c b/dlls/dcomp/device.c
+index 6cff366..4efb27d 100644
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -77,13 +77,15 @@ static HRESULT STDMETHODCALLTYPE device_QueryInterface(IDCompositionDevice *ifac
+               && (IsEqualGUID(iid, &IID_IDCompositionDevice2)
+                   || IsEqualGUID(iid, &IID_IDCompositionDesktopDevice)))
+               || IsEqualGUID(iid, &IID_IDCompositionDesktopDevicePartner)
+-              || IsEqualGUID(iid, &IID_IDCompositionDeviceUnknown))
++              || IsEqualGUID(iid, &IID_IDCompositionDeviceUnknown)
++              || !memcmp(iid, "\x68\x69\x55\x6b\x25\x2d\xe2\x11\x99\xf6\x8b\xc3\x60\x88\x70\x9b", 16))
+     {
+         IUnknown_AddRef(&device->IDCompositionDeviceUnknown_iface);
+         *out = &device->IDCompositionDeviceUnknown_iface;
+ 
+         if (IsEqualGUID(iid, &IID_IDCompositionDesktopDevicePartner)
+-            || IsEqualGUID(iid, &IID_IDCompositionDeviceUnknown))
++            || IsEqualGUID(iid, &IID_IDCompositionDeviceUnknown)
++            || !memcmp(iid, "\x68\x69\x55\x6b\x25\x2d\xe2\x11\x99\xf6\x8b\xc3\x60\x88\x70\x9b", 16))
+             FIXME("Returning undocumented interface %s %p.\n", wine_dbgstr_guid(iid), *out);
+         return S_OK;
+     }
+@@ -1050,6 +1052,7 @@ static HRESULT STDMETHODCALLTYPE desktop_device_CreateSurface(IDCompositionDevic
+ {
+     FIXME("iface %p, width %u, height %u, format %#x, alpha_mode %#x, surface %p stub!\n", iface,
+             width, height, pixel_format, alpha_mode, surface);
++    if (surface) *surface = NULL;
+     return E_NOTIMPL;
+ }
+ 
+@@ -2129,3 +2132,12 @@ HRESULT WINAPI DCompPrivates_SetCommitCompletionEvent(IDCompositionDevice *devic
+     ERR("(%p, %p)\n", device, event);
+     return S_OK;
+ }
++
++DWORD WINAPI DCompositionWaitForCompositorClock(UINT count, const HANDLE *handles, DWORD timeout)
++{
++    TRACE("(%u, %p, %lu)\n", count, handles, timeout);
++    if (count && handles)
++        return WaitForMultipleObjects(count, handles, FALSE, timeout);
++    Sleep(timeout < 16 ? timeout : 16);
++    return WAIT_TIMEOUT;
++}

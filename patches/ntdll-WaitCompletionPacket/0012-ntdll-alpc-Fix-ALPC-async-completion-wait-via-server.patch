@@ -1,0 +1,50 @@
+From: Zhymabek Roman <robanokssamit@yandex.ru>
+Subject: [PATCH] ntdll/alpc: Fix ALPC async wait via server_wait_for_object
+
+Wait on ALPC async completion using server_wait_for_object so server
+APCs populate io.Status and io.Information.
+---
+ dlls/ntdll/unix/alpc.c | 21 ++++++++++++++-------
+ 1 file changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/ntdll/unix/alpc.c b/dlls/ntdll/unix/alpc.c
+index d2bcf46..3038ded 100644
+--- a/dlls/ntdll/unix/alpc.c
++++ b/dlls/ntdll/unix/alpc.c
+@@ -340,9 +340,13 @@ NTSTATUS WINAPI NtAlpcConnectPort( HANDLE *port_handle, UNICODE_STRING *port_nam
+ 
+     if (wait_handle)
+     {
+-        NtWaitForSingleObject( wait_handle, FALSE, timeout );
+-        NtClose( wait_handle );
+-        ret = io.Status;
++        unsigned int wait_ret = server_wait_for_object( wait_handle, FALSE, timeout );
++        if (!wait_ret) ret = io.Status;
++        else
++        {
++            NtClose( wait_handle );
++            ret = wait_ret;
++        }
+     }
+ 
+     if (ret && ret != STATUS_PENDING && *port_handle)
+@@ -533,12 +537,15 @@ NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE port_handle, DWORD flags,
+     if (ret != STATUS_PENDING) free( async );
+     else if (wait_handle)
+     {
+-        NtWaitForSingleObject( wait_handle, FALSE, timeout );
+-        NtClose( wait_handle );
+-        ret = io.Status;
++        unsigned int wait_ret = server_wait_for_object( wait_handle, FALSE, timeout );
++        if (!wait_ret) ret = io.Status;
++        else
++        {
++            NtClose( wait_handle );
++            ret = wait_ret;
++        }
+         wait_handle = NULL;
+     }
+-    if (wait_handle) NtClose( wait_handle );
+     }
+ 
+     if (!ret && recv_buffer_size) *recv_buffer_size = io.Information;
